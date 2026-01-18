@@ -1,11 +1,37 @@
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{post, get}};
 use reqwest::Method;
 use serde::Deserialize;
+use serde_json::json;
 use serde_with::serde_as;
 use sha3::{Digest, Keccak256};
 use tower_http::cors::{Any, CorsLayer};
 use std::sync::Arc;
 use crate::{block::{model_struct::Hash, transaction::TransactionData}, network::{message::NetworkMessage, node::NodeManage}};
+use hex;
+
+#[derive(Deserialize)]
+struct RpcRequest{
+    method: String,
+    params: Vec<serde_json::Value>,
+    id: serde_json::Value,
+}
+
+async fn handle_eth_request(
+    State(manager): State<Arc<NodeManage>>,
+    Json(req): Json<RpcRequest>,
+) -> impl IntoResponse{
+    match req.method.as_str(){
+        "eth_chainId" => {
+            let hex_chain_id = format!("0x{:x}", 555);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "result": hex_chain_id
+            }))
+        },
+        _ => Json(json!({"jsonrpc": "2.0", "id": req.id, "error": "Method NOt FOund"})),
+    }.into_response()
+}
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -27,6 +53,7 @@ pub async fn start_rpc_server(manager: Arc<NodeManage>, rpc_port: u16){
 
     let app = Router::new()
         .route("/transaction", post(handle_tx_submission))
+        .route("/nonce/{address}", get(get_nonce_handler))
         .layer(cors)
         .with_state(manager);
     let addr = format!("0.0.0.0:{}", rpc_port);
@@ -54,8 +81,8 @@ async fn handle_tx_submission(
     {
         let mut state = manager.state.write().await;
         let storage = state.storage.clone();
-
-        let cur_nonce = state.global_state.get_nonce(&sender_address, &storage);
+        let storage_clone = storage.clone();
+        let cur_nonce = state.global_state.get_nonce(&sender_address, storage);
         if tx.nonce!= cur_nonce{
             println!("[RPC]: Nonce mismatch");
             return Err(StatusCode::BAD_REQUEST);
@@ -64,12 +91,34 @@ async fn handle_tx_submission(
             return Err(StatusCode::CONFLICT);
         }
         state.mempool.insert(sig_hash, tx.clone());
-    }
-    let msg = NetworkMessage::Transaction(tx.clone());
-    let manager_clone = manager.clone();
-    tokio::spawn(async move{manager_clone.broadcast(msg).await;});
 
+        state.global_state.increase_nonce_only(tx.sender, storage_clone);
+        
+    }
+    let msg = NetworkMessage::NewTransaction(tx.clone());
+    let manager_clone = manager.clone();
+    
+
+    tokio::spawn(async move{manager_clone.broadcast(msg).await;});
     Ok(Json(sig_hash))
+}
+
+async fn get_nonce_handler(
+    State(manager): State<Arc<NodeManage>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse{
+    let address = hex_to_address(&address);
+    let mut manager_clone = manager.state.read().await;
+    let nonce = manager_clone.global_state.get_nonce_readonly(&address);
+    Json(nonce)
+}
+
+fn hex_to_address(hex_str: &String) -> [u8;20]{
+    let clean_hex = hex_str.trim_start_matches("0x");
+    let decoded = hex::decode(clean_hex).expect("INVALID HEX");
+    let mut address = [0u8;20];
+    address.copy_from_slice(&decoded[..20]);
+    address
 }
 
 impl TransactionRequest{

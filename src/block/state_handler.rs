@@ -22,7 +22,7 @@ impl BalanceReader{
     }
     pub async fn get_balance(&self, address: [u8; 20]) -> u64{
         let mut state = self.inner.write().await;
-        state.get_balance(&address, &self.storage)
+        state.get_balance(&address, self.storage.clone())
     }
     pub async fn get_pending_gas(&self) -> u64{
         let state = self.inner.read().await;
@@ -38,12 +38,12 @@ impl BalanceWriter{
     pub async fn exc_committed_transaction(&self, from:[u8;20], to:[u8;20], amount:u64, fee:u64) -> bool{
         let mut state = self.inner.write().await;
 
-        let sender_balance = state.get_balance(&from, &self.storage);
+        let sender_balance = state.get_balance(&from, self.storage.clone());
         if (sender_balance < amount) && (fee < amount) {return false;}
         state.set_balance(from, sender_balance-amount, &self.storage);
 
         let net_amount = amount.saturating_sub(fee);
-        let receiver_cur = state.get_balance(&to, &self.storage);
+        let receiver_cur = state.get_balance(&to, self.storage.clone());
         state.set_balance(to, receiver_cur + net_amount, &self.storage);
         state.add_gas(fee);
         true
@@ -58,7 +58,7 @@ impl BalanceWriter{
             .collect();
         for (addr, share) in shares{
             let reward = (total_gas * share)/100;
-            let current = state.get_balance(&addr, &self.storage);
+            let current = state.get_balance(&addr, self.storage.clone());
             state.set_balance(addr,current+reward, &self.storage);
         }
         ("[GAS]:가스비 분배 완료");

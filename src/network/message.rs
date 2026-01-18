@@ -5,12 +5,14 @@ use std::net::SocketAddr;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage{
     Hello {listening_port: u16},
-    Transaction(TransactionData), //트랜잭션 전파
-    Block(BlockData), // 블록 전파
+    NewTransaction(TransactionData), //트랜잭션 전파
+    NewBlock(BlockData), // 블록 전파
     GetPeers, //외부의 노드들에 대해 피어 공유 요청
     Peers(Vec<SocketAddr>), //보유한 노드들의 주소 공유
     Ping,
     Pong,
+    GetBlocks,
+    Inventory(Vec<BlockData>),
 }
 
 impl NetworkMessage{

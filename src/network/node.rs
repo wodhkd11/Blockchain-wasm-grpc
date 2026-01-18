@@ -21,6 +21,7 @@ pub struct Node{
     pub port:u16,
     pub addr: SocketAddr,
     pub wallet: [u8; 20],
+    pub chain_id: u64,
     pub peers: HashMap<SocketAddr, Peer>,
     pub unconnected_addrs: HashSet<SocketAddr>,
     pub max_peers: usize ,
@@ -44,6 +45,7 @@ impl NodeManage{
                 port,
                 addr: node_addr,
                 wallet: wallet,
+                chain_id: 6699,
                 peers: HashMap::new(),
                 unconnected_addrs: HashSet::new(),
                 max_peers: 100, // Default: 10, need to change
@@ -71,6 +73,8 @@ impl NodeManage{
         let rc = Arc::clone(&manager);
         tokio::spawn(async move{rc.start_reconnector().await;});
 
+        let mn = Arc::clone(&manager);
+        tokio::spawn(async move{mn.start_miner().await;});
         //let tester = Arc::clone(&self);
         //tokio::spawn(async move{run_block_tester(tester).await;});
 

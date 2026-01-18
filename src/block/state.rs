@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::block::{db::{self, Storage}, model_struct::BlockData};
@@ -33,7 +33,7 @@ impl GlobalBalance{
      * This check current block(Not confirmed) first
      * 
      */
-    pub fn get_account(&mut self, address: &[u8; 20], db: &Storage) -> Account{
+    pub fn get_account(&mut self, address: &[u8; 20], db: Arc<Storage>) -> Account{
         
         if let Some(acc) = self.balances.get(address) {
             return acc.clone();
@@ -50,11 +50,16 @@ impl GlobalBalance{
         }
     }
 
-    pub fn get_balance(&mut self, address: &[u8; 20], db: &Storage) -> u64{
+    pub fn get_balance(&mut self, address: &[u8; 20], db: Arc<Storage>) -> u64{
         self.get_account(address, db).balance
     }
-    pub fn get_nonce(&mut self, address: &[u8; 20], db: &Storage) -> u64{
+    pub fn get_nonce(&mut self, address: &[u8; 20], db: Arc<Storage>) -> u64{
         self.get_account(address, db).nonce
+    }
+    pub fn get_nonce_readonly(&self, address: &[u8;20]) -> u64{
+        self.balances.get(address)
+            .map(|acc| acc.nonce)
+            .unwrap_or(0)
     }
 
     pub(crate) fn set_balance(&mut self, address: [u8; 20], amount: u64, db: &Storage){
@@ -64,7 +69,15 @@ impl GlobalBalance{
         });
         account.balance = amount;
     }
-    pub(crate) fn increase_nonce(&mut self, address: [u8; 20], new_balance: u64, db: &Storage){
+
+    pub fn increase_nonce_only(&mut self, address: [u8; 20], db: Arc<Storage>){
+        let account = self.balances.entry(address).or_insert_with(||{
+            db.get_account(&address).unwrap_or(Account{balance:0, nonce:0})
+        });
+        account.nonce = account.nonce.saturating_add(1);
+    }
+
+    pub fn increase_nonce_change_balance(&mut self, address: [u8; 20], new_balance: u64, db: &Storage){
         let account = self.balances.entry(address).or_insert_with(||{
             db.get_account(&address).unwrap_or(Account { balance: 0, nonce: 0 })
         });

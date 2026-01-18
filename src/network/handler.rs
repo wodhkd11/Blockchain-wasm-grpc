@@ -12,7 +12,7 @@ impl NodeManage{
 
     pub async fn handle_message(self: Arc<Self>, from_addr: SocketAddr, msg: NetworkMessage){
         let needs_gossip = match &msg{
-            NetworkMessage::Transaction(_) | NetworkMessage::Block(_) => true,
+            NetworkMessage::NewTransaction(_) | NetworkMessage::NewBlock(_) => true,
             _ => false,
         };
         if needs_gossip{
@@ -27,10 +27,10 @@ impl NodeManage{
 
         if needs_gossip{ println!("Received Message: {:?} from {}", msg, from_addr); }
         match msg{
-            NetworkMessage::Block(block) =>{
+            NetworkMessage::NewBlock(block) =>{
                 
             }
-            NetworkMessage::Transaction(tx) => {
+            NetworkMessage::NewTransaction(tx) => {
                 let sig_hash:[u8;32] = {
                     let mut hasher = Keccak256::new();
                     hasher.update(&tx.signature);

@@ -2,17 +2,55 @@
 pub mod signature;
 
 ==> ./src/crypto/signature.rs <==
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use sha3::{Keccak256, Digest};
+
+use crate::block::model_struct::Address;
 
 
+pub fn verify(
+    sender: Address,
+    signature_bytes: &[u8; 65],
+    message: &[u8],
+) -> bool{
+    let prefix = format!("\x19Ethereum Signed Message:\n{}",message.len());
+    
+    let mut eth_message = Vec::new();
+    eth_message.extend_from_slice(prefix.as_bytes());
+    eth_message.extend_from_slice(message);
 
-pub fn verify(public_key_bytes: &[u8;32], signature_bytes: &[u8; 64], message: &[u8]) -> bool{
-    let Ok(public_key) = VerifyingKey::from_bytes(public_key_bytes)else{
-        return false;
+
+    let msg_hash = Keccak256::digest(&eth_message);
+    let sig = match Signature::from_slice(&signature_bytes[..64]){
+        Ok(s) => s,
+        Err(_) => return false,
     };
-    let signature = Signature::from_bytes(signature_bytes);
 
-    public_key.verify(message, &signature).is_ok()
+    let v = signature_bytes[64];
+    let rec_id = if v >= 27 { v - 27} else {v};
+
+    let recovery_id = match RecoveryId::from_byte(rec_id){
+        Some(id) => id,
+        None => return false,
+    };
+
+    let recovered_key = match VerifyingKey::recover_from_prehash(&msg_hash, &sig, recovery_id){
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+    let recovered_address = public_key_to_address(&recovered_key);
+    recovered_address == sender
+
+}
+
+
+fn public_key_to_address(verifying_key: &VerifyingKey) -> [u8; 20]{
+    let encoded = verifying_key.to_encoded_point(false);
+    let public_key_bytes = &encoded.as_bytes()[1..];
+    let hash = Keccak256::digest(public_key_bytes);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hash[12..]);
+    address
 }
 ==> ./src/network/message.rs <==
 use serde::{Serialize, Deserialize};
@@ -68,8 +106,8 @@ impl NetworkMessage{
     }
 
     pub fn get_id(&self) -> Vec<u8>{
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        use sha3::{Keccak256, Digest};
+        let mut hasher = Keccak256::new();
         hasher.update(self.serialize());
         hasher.finalize().to_vec()
     }
@@ -100,7 +138,7 @@ impl NodeManage{
 }
 ==> ./src/network/tasks/mod.rs <==
 pub mod gc;
-pub mod generator;
+//pub mod generator;
 pub mod connection;
 ==> ./src/network/tasks/connection.rs <==
 use std::sync::Arc;
@@ -161,7 +199,7 @@ impl NodeManage{
     }
 }
 ==> ./src/network/tasks/generator.rs <==
-
+/*
 use std::net::SocketAddr;
 use std::sync::Arc;
 use rand::Rng;
@@ -179,18 +217,19 @@ impl NodeManage{
                 rng.gen_range(2..=6)
             };
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            let tx = {
+            let tx:TransactionData = {
                 let mut rng = rand::thread_rng();
-                let mut sender = [0u8; 32];
+                let mut sender = [0u8; 20];
                 let mut receiver = [0u8; 20];
                 rng.fill(&mut sender);
                 rng.fill(&mut receiver);
                 TransactionData::new(
                     sender,
                     receiver,
-                    vec![0xFF; 1024],
-                    rng.gen_range(1..100),
-                    [0xFF;64],
+                    value,
+                    nonce:0
+                    payload: vec![0xFF; 1024],
+                    signature: [0xFF;65],
                 )
             };
             let msg = NetworkMessage::Transaction(tx);
@@ -203,10 +242,13 @@ impl NodeManage{
     }
 
 }
+    */
 ==> ./src/network/handler.rs <==
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+
+use sha3::{Digest, Keccak256};
 
 use crate::network::node::NodeManage;
 use crate::network::message::NetworkMessage;
@@ -231,11 +273,18 @@ impl NodeManage{
 
         if needs_gossip{ println!("Received Message: {:?} from {}", msg, from_addr); }
         match msg{
+            NetworkMessage::Block(block) =>{
+                
+            }
             NetworkMessage::Transaction(tx) => {
-                let tx_hash = tx.hash;
+                let sig_hash:[u8;32] = {
+                    let mut hasher = Keccak256::new();
+                    hasher.update(&tx.signature);
+                    hasher.finalize().into()
+                };
                 let mut state = self.state.write().await;
-                if !state.mempool.contains_key(&tx_hash){
-                    state.mempool.insert(tx_hash, tx.clone());
+                if !state.mempool.contains_key(&sig_hash){
+                    state.mempool.insert(sig_hash, tx.clone());
                     println!("[New transaction Added], Total: {}",state.mempool.len());
                 }
             }
@@ -452,6 +501,8 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr};
 use std::time::{Instant};
+//use crate::block::block_tester::run_block_tester;
+use crate::block::db::Storage;
 use crate::block::model_struct::{Hash};
 use crate::block::state::GlobalBalance;
 use crate::block::transaction::TransactionData;
@@ -463,12 +514,14 @@ use crate::network::peer::{Peer};
 pub struct Node{ 
     pub port:u16,
     pub addr: SocketAddr,
+    pub wallet: [u8; 20],
     pub peers: HashMap<SocketAddr, Peer>,
     pub unconnected_addrs: HashSet<SocketAddr>,
     pub max_peers: usize ,
     pub recent_seen_message: HashMap<Vec<u8>, Instant>,
-    pub mempool: HashMap<Hash, TransactionData>, // 다음 블록이 생기기 이전까지 캐시 역할을 맡음. 
-    pub global_state: GlobalBalance,
+    pub mempool: HashMap<Hash, TransactionData>, // 다음 블록이 생기기 이전까지 트랜잭션 저장 캐시 역할을 맡음. 
+    pub global_state: GlobalBalance, //블록 생기기 전까지 잔액을 관리함
+    pub storage: Arc<Storage>,
 }
 
 #[derive(Clone)]
@@ -478,24 +531,27 @@ pub struct NodeManage{
 impl NodeManage{
 
 
-    pub fn new(port:u16, addr: &str) -> Self{
+    pub fn new(port:u16, addr: &str, wallet: [u8;20], path: &str) -> Self{
         let node_addr = addr.parse().expect("INVALID ADDR");
         Self { 
             state: Arc::new(RwLock::new(Node{
                 port,
                 addr: node_addr,
+                wallet: wallet,
                 peers: HashMap::new(),
                 unconnected_addrs: HashSet::new(),
                 max_peers: 100, // Default: 10, need to change
                 recent_seen_message: HashMap::new(),
                 mempool: HashMap::new(),
                 global_state: GlobalBalance::new(),
+                storage: Arc::new(Storage::new(path)),
             })),
          }
     }
     pub async fn start(self: Arc<Self>, seeds:Vec<&str>) {
         let addr = {self.state.read().await.addr};
         let listener = TcpListener::bind(addr).await.unwrap();
+        let my_addr = self.state.read().await.wallet;
 
         //Make Ping - Pong for runtime
         let manager = Arc::clone(&self);
@@ -509,8 +565,12 @@ impl NodeManage{
         let rc = Arc::clone(&manager);
         tokio::spawn(async move{rc.start_reconnector().await;});
 
+        //let tester = Arc::clone(&self);
+        //tokio::spawn(async move{run_block_tester(tester).await;});
+
         //let txgen = Arc::clone(&manager);
         //tokio::spawn(async move {txgen.start_transaction_generator().await;});
+        
         
         let my_port = manager.state.read().await.port;
         let rpcport = my_port + 1000;
@@ -661,27 +721,38 @@ impl Peer{
     }
 }
 ==> ./src/network/rpc.rs <==
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{post, get}};
+use reqwest::Method;
 use serde::Deserialize;
 use serde_with::serde_as;
-use sha2::{Digest, Sha256};
+use sha3::{Digest, Keccak256};
+use tower_http::cors::{Any, CorsLayer};
 use std::sync::Arc;
 use crate::{block::{model_struct::Hash, transaction::TransactionData}, network::{message::NetworkMessage, node::NodeManage}};
+use hex;
 
 #[serde_as]
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TransactionRequest{
-    pub sender: [u8; 32],
+    pub sender: [u8; 20],
     pub receiver: [u8; 20],
-    pub payload: Vec<u8>,
+    pub value: u64,
     pub nonce: u64,
-    #[serde_as(as = "[_; 64]")]
-    pub signature: [u8; 64],
+    pub payload: Vec<u8>,
+    #[serde_as(as = "[_; 65]")]
+    pub signature: [u8; 65],
 } // after get string, to_hex and do Transaction::New()
 
 pub async fn start_rpc_server(manager: Arc<NodeManage>, rpc_port: u16){
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::GET])
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/transaction", post(handle_tx_submission))
+        .route("/nonce/:address", get(get_nonce_handler))
+        .layer(cors)
         .with_state(manager);
     let addr = format!("0.0.0.0:{}", rpc_port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -698,38 +769,59 @@ async fn handle_tx_submission(
     State(manager): State<Arc<NodeManage>>,
     Json(payload): Json<TransactionRequest>,
 ) -> Result<Json<Hash>, StatusCode>{
+    let mut hasher = Keccak256::new();
+    hasher.update(&payload.signature);
+    let sig_hash: [u8; 32] = hasher.finalize().into();
+
     let tx = payload.to_core_data().ok_or(StatusCode::UNAUTHORIZED)?;
-    let tx_hash = tx.hash;
+
+    let sender_address = tx.sender;
     {
         let mut state = manager.state.write().await;
-        let sender_address ={
-            let mut hasher = Sha256::new();
-            hasher.update(&tx.sender);
-            let result = hasher.finalize();
-            let mut addr = [0u8 ; 20];
-            addr.copy_from_slice(&result[..20]);
-            addr
-        };
-        let current_nonce = state.global_state.get_nonce(&sender_address);
-        if tx.nonce != current_nonce{
-            println!("[RPC]: Nonce mismatch\n ==> Expected: {current_nonce}, Got: {}",tx.nonce);
-            return Err(StatusCode::BAD_REQUEST)
+        let storage = state.storage.clone();
+        let storage_clone = storage.clone();
+        let cur_nonce = state.global_state.get_nonce(&sender_address, storage);
+        if tx.nonce!= cur_nonce{
+            println!("[RPC]: Nonce mismatch");
+            return Err(StatusCode::BAD_REQUEST);
         }
-        if state.mempool.contains_key(&tx_hash){
+        if state.mempool.contains_key(&sig_hash){
             return Err(StatusCode::CONFLICT);
         }
-        state.mempool.insert(tx.hash, tx.clone());
-        println!("[NEW TRANSACTION] New transaction got: {:?}",tx_hash);
-    }
-    let msg = NetworkMessage::Transaction(tx);
-    let manager_clone = manager.clone();
-    tokio::spawn(async move{manager_clone.broadcast(msg).await;});
+        state.mempool.insert(sig_hash, tx.clone());
 
-    Ok(Json(tx_hash))
+        state.global_state.increase_nonce_only(tx.sender, storage_clone);
+        
+    }
+    let msg = NetworkMessage::Transaction(tx.clone());
+    let manager_clone = manager.clone();
+    
+
+    tokio::spawn(async move{manager_clone.broadcast(msg).await;});
+    Ok(Json(sig_hash))
+}
+
+async fn get_nonce_handler(
+    State(manager): State<Arc<NodeManage>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse{
+    let address = hex_to_address(&address);
+    let mut manager_clone = manager.state.write().await;
+    let db_addr = manager_clone.storage.clone();
+    let nonce = manager_clone.global_state.get_nonce(&address, db_addr);
+    Json(nonce)
+}
+
+fn hex_to_address(hex_str: &String) -> [u8;20]{
+    let clean_hex = hex_str.trim_start_matches("0x");
+    let decoded = hex::decode(clean_hex).expect("INVALID HEX");
+    let mut address = [0u8;20];
+    address.copy_from_slice(&decoded[..20]);
+    address
 }
 
 impl TransactionRequest{
-    pub fn to_core_data(self) -> Option<TransactionData>{
+    pub fn to_core_data(&self) -> Option<TransactionData>{
         if !self.verify_signature(){
             println!("[RPC]: INVALID SIGNATURE");
             return None;
@@ -739,7 +831,8 @@ impl TransactionRequest{
         Some(TransactionData::new(
             self.sender,
             self.receiver,
-            self.payload,
+            self.value,
+            self.payload.clone(),
             self.nonce,
             self.signature,
         ))
@@ -748,10 +841,11 @@ impl TransactionRequest{
         let mut v = Vec::new();
         v.extend_from_slice(&self.sender);
         v.extend_from_slice(&self.receiver);
-        v.extend_from_slice(&self.payload);
+        v.extend_from_slice(&self.value.to_be_bytes());
         v.extend_from_slice(&self.nonce.to_be_bytes());
+        v.extend_from_slice(&self.payload);
 
-        crate::crypto::signature::verify(&self.sender, &self.signature, &v)
+        crate::crypto::signature::verify(self.sender, &self.signature, &v)
     }
 }
 ==> ./src/main.rs <==
@@ -762,7 +856,7 @@ use network::node::Node;
 use std::{env, net::SocketAddr, sync::Arc};
 use tokio::time::{sleep, Duration};
 
-use crate::network::node::NodeManage;
+use crate::{ network::node::NodeManage};
 
 #[tokio::main]
 async fn main() {
@@ -780,15 +874,23 @@ async fn main() {
     let my_port: u16 = args[1].parse().expect("포트 번호는 숫자여야 합니다.");
     let my_addr_str = format!("127.0.0.1:{}", my_port);
 
+    let db_path = format!("data/node_{my_port}");
+
     // 3. 시드 노드 주소들 추출 (2번째 인자부터 끝까지)
     let seeds: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
 
     println!("🚀 노드 가동 준비 중...");
     println!("📍 내 주소: {}", my_addr_str);
     println!("🌱 시드 노드 목록: {:?}", seeds);
+    
+    let wallet_str =  "9a88fba688549f107c6d97f8415f8eb6b6f76f98";
+    let mut wallet: [u8; 20] = [0;20];
+    hex::decode_to_slice(wallet_str, &mut wallet).expect("");
+
+
 
     // 4. NodeManage 생성 및 실행
-    let node_manager = Arc::new(NodeManage::new(my_port, &my_addr_str));
+    let node_manager = Arc::new(NodeManage::new(my_port, &my_addr_str, wallet, &db_path));
     
     // start 함수가 내부적으로 Discovery를 수행하고 리스닝 루프를 돌립니다.
     node_manager.start(seeds).await;
@@ -834,41 +936,42 @@ async fn main() {
 ==> ./src/block/transaction.rs <==
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use sha2::{Digest, Sha256};
+use sha3::{Digest, Keccak256};
 use crate::{block::model_struct::{Address, Hash}, crypto::signature};
 
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransactionData{
-    pub sender: [u8; 32],
+    pub sender: Address,
     pub receiver: Address,
-    pub payload: Vec<u8>,
+    pub value: u64,
     pub nonce: u64, // 이중지불 방지용 트랜잭션 순서
-    pub hash: Hash,
-    #[serde_as(as = "[_; 64]")]
-    pub signature: [u8; 64],
+    pub payload: Vec<u8>,
+    #[serde_as(as = "[_; 65]")]
+    pub signature: [u8; 65],
 }
 
 impl TransactionData{
-    pub fn new(sender: [u8;32], receiver: [u8; 20], payload: Vec<u8>, nonce: u64, signature:[u8; 64] ) -> Self{
-        let mut tx = Self{
+    pub fn new(sender: [u8;20], receiver: [u8; 20], value: u64, payload: Vec<u8>, nonce: u64, signature:[u8; 65] ) -> Self{
+        let tx = Self{
             sender,
             receiver,
-            payload,
+            value,
             nonce,
-            hash: [0u8; 32],
+            payload,
             signature,
         };
-        tx.hash = tx.calculate_hash();
         tx
     }
 
     pub fn calculate_hash(&self) -> Hash {
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         hasher.update(&self.sender);
         hasher.update(&self.receiver);
-        hasher.update(&self.payload);
+        hasher.update(&self.value.to_be_bytes());
         hasher.update(&self.nonce.to_be_bytes());
+        hasher.update(&self.payload);
+        hasher.update(&self.signature);
 
         let result = hasher.finalize();
         let mut hash_res = [0u8; 32];
@@ -876,29 +979,33 @@ impl TransactionData{
         hash_res
     }
 
-    pub fn verify(&self) -> bool{
-        let message = self.generate_payload_to_bytes();
-        signature::verify(&self.sender, &self.signature, &message)
-    }
-
     pub fn generate_payload_to_bytes(&self) -> Vec<u8>{
         let mut v = Vec::new();
         v.extend_from_slice(&self.sender);
         v.extend_from_slice(&self.receiver);
-        v.extend_from_slice(&self.payload);
+        v.extend_from_slice(&self.value.to_be_bytes());
         v.extend_from_slice(&self.nonce.to_be_bytes());
-
+        v.extend_from_slice(&self.payload);
         v
+    }
+    
+    pub fn verify(&self) -> bool{
+        let message = self.generate_payload_to_bytes();
+        signature::verify(self.sender, &self.signature, &message)
     }
 }
 
+#[serde_as]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfirmedTransaction{
     pub sender: Address,
     pub receiver: Address,
+    pub value: u64,
+    pub nonce: u64, // 이중지불 방지용 트랜잭션 순서
     pub payload: Vec<u8>,
-    pub nonce: u64,
+    #[serde_as(as = "[_; 65]")]
+    pub signature: [u8; 65],
     pub hash: Hash,
-    pub signature: [u8; 64],
 }
 
 impl ConfirmedTransaction{
@@ -907,22 +1014,80 @@ impl ConfirmedTransaction{
      * and returns ConfirmedTransaction
      */
     pub fn from(tx: &TransactionData) -> Self{
-        let mut hasher = Sha256::new();
-        hasher.update(&tx.sender);
-        let result = hasher.finalize();
-        let mut sender_address = [0u8; 20];
-        sender_address.copy_from_slice(&result[..20]);
+        let tx_hash = tx.calculate_hash();
         Self{
-            sender: sender_address,
+            sender: tx.sender,
             receiver: tx.receiver,
+            value: tx.value,
             payload: tx.payload.clone(),
             nonce: tx.nonce,
-            hash: tx.hash,
             signature: tx.signature,
+            hash: tx_hash,
         }
     }
 
 }
+==> ./src/block/block_tester.rs <==
+//use std::{sync::Arc, time::Duration};
+
+//use sha3::{Digest, Keccak256};
+//use tokio::time::interval;
+
+//use crate::{block::model_struct::{BlockData, BlockHeader}, network::node::NodeManage};
+
+
+
+
+//pub async fn run_block_tester(manager: Arc<NodeManage>){
+    //let mut tick = interval(Duration::from_secs(10));
+    //loop{
+        //tick.tick().await;
+
+
+        //let node = manager.state.read().await;
+        //let my_address = [0xFF; 20];
+
+        //let current_slot = std::
+
+
+        //let mut node = manager.state.write().await;
+        //if node.mempool.is_empty(){
+            //println!("[PRODUCER]: Mempool is empty");
+        //}
+
+        //let transactions: Vec<_> = node.mempool.values().cloned().collect();
+        //node.mempool.clear();
+
+        //let cur_height = 1 as u64;
+        //let header = BlockHeader{
+            //height: cur_height,
+            //prev_block_hash: [0u8;32],
+            //merkle_root:[0u8;32],
+            //timestamp: std::time::SystemTime::now()
+                //.duration_since(std::time::UNIX_EPOCH)
+                //.unwrap()
+                //.as_secs(),
+            //valdiator: [0x11; 20],
+        //};
+        //let block_hash = {
+            //let mut hasher = Sha256::new();
+            //hasher.update(header.height.to_be_bytes());
+            //let res = hasher.finalize();
+            //let mut h = [0u8;32];
+            //h.copy_from_slice(&res);
+            //h
+        //};
+        //let block = BlockData{
+            //header,
+            //body: transactions,
+            //hash: block_hash,
+            //signature: vec![],
+        //};
+        //let storage = node.storage.clone();
+        //node.global_state.commit_to_db(&storage, &block);
+        //println!("[NEW BLOCK]: {:?}", block)
+    //}
+//}
 ==> ./src/block/db.rs <==
 use std::collections::HashMap;
 
@@ -1051,11 +1216,12 @@ pub mod state;
 pub mod state_handler;
 pub mod transaction;
 pub mod db;
+pub mod block_tester;
 ==> ./src/block/state.rs <==
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
-use crate::block::db::{self, Storage};
+use crate::block::{db::{self, Storage}, model_struct::BlockData};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1083,8 +1249,12 @@ impl GlobalBalance{
             gas_pool: 0,
         }
     }
-
-    pub fn get_account(&mut self, address: &[u8; 20], db: &Storage) -> Account{
+    /**
+     * This check current block(Not confirmed) first
+     * 
+     */
+    pub fn get_account(&mut self, address: &[u8; 20], db: Arc<Storage>) -> Account{
+        
         if let Some(acc) = self.balances.get(address) {
             return acc.clone();
         }
@@ -1100,10 +1270,10 @@ impl GlobalBalance{
         }
     }
 
-    pub fn get_balance(&mut self, address: &[u8; 20], db: &Storage) -> u64{
+    pub fn get_balance(&mut self, address: &[u8; 20], db: Arc<Storage>) -> u64{
         self.get_account(address, db).balance
     }
-    pub fn get_nonce(&mut self, address: &[u8; 20], db: &Storage) -> u64{
+    pub fn get_nonce(&mut self, address: &[u8; 20], db: Arc<Storage>) -> u64{
         self.get_account(address, db).nonce
     }
 
@@ -1114,7 +1284,15 @@ impl GlobalBalance{
         });
         account.balance = amount;
     }
-    pub(crate) fn increase_nonce(&mut self, address: [u8; 20], new_balance: u64, db: &Storage){
+
+    pub fn increase_nonce_only(&mut self, address: [u8; 20], db: Arc<Storage>){
+        let account = self.balances.entry(address).or_insert_with(||{
+            db.get_account(&address).unwrap_or(Account{balance:0, nonce:0})
+        });
+        account.nonce = account.nonce.saturating_add(1);
+    }
+
+    pub fn increase_nonce_change_balance(&mut self, address: [u8; 20], new_balance: u64, db: &Storage){
         let account = self.balances.entry(address).or_insert_with(||{
             db.get_account(&address).unwrap_or(Account { balance: 0, nonce: 0 })
         });
@@ -1134,10 +1312,10 @@ impl GlobalBalance{
         amount
     }
 
-    pub fn commit_to_db(&mut self, db: &Storage){
-        if self.balances_is_empty(){return;}
-        db.commit_block(&self.balances);
-
+    pub fn commit_to_db(&mut self, db: &Storage, block: &BlockData){
+        db.commit_block(block, &self.balances);
+        self.balances.clear();
+        if self.gas_pool > 0{println!("[WARN] Gas pool is not empty during comit");}
     }
 }
 ==> ./src/block/state_handler.rs <==
@@ -1145,25 +1323,27 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::block::state::GlobalBalance;
+use crate::block::{db::Storage, state::GlobalBalance};
 
 #[derive(Clone)]
 pub struct BalanceReader{
     inner: Arc<RwLock<GlobalBalance>>,
+    storage: Arc<Storage>
 }
 #[derive(Clone)]
 pub struct BalanceWriter{
     inner: Arc<RwLock<GlobalBalance>>,
+    storage: Arc<Storage>
 }
 
 //balanceReader
 impl BalanceReader{
-    pub fn new(inner: Arc<RwLock<GlobalBalance>>) -> Self{
-        Self{inner}
+    pub fn new(inner: Arc<RwLock<GlobalBalance>>, storage: Arc<Storage>) -> Self{
+        Self{inner, storage}
     }
     pub async fn get_balance(&self, address: [u8; 20]) -> u64{
-        let state = self.inner.read().await;
-        state.get_balance(&address)
+        let mut state = self.inner.write().await;
+        state.get_balance(&address, self.storage.clone())
     }
     pub async fn get_pending_gas(&self) -> u64{
         let state = self.inner.read().await;
@@ -1172,20 +1352,20 @@ impl BalanceReader{
 }
 
 impl BalanceWriter{
-    pub fn new(inner: Arc<RwLock<GlobalBalance>>) -> Self{
-        Self{inner}
+    pub fn new(inner: Arc<RwLock<GlobalBalance>>, storage: Arc<Storage>) -> Self{
+        Self{inner, storage}
     }
 
     pub async fn exc_committed_transaction(&self, from:[u8;20], to:[u8;20], amount:u64, fee:u64) -> bool{
         let mut state = self.inner.write().await;
 
-        let sender_balance = state.get_balance(&from);
+        let sender_balance = state.get_balance(&from, self.storage.clone());
         if (sender_balance < amount) && (fee < amount) {return false;}
-        state.set_balance(from, sender_balance-amount);
+        state.set_balance(from, sender_balance-amount, &self.storage);
 
         let net_amount = amount.saturating_sub(fee);
-        let receiver_cur = state.get_balance(&to);
-        state.set_balance(to, receiver_cur + net_amount);
+        let receiver_cur = state.get_balance(&to, self.storage.clone());
+        state.set_balance(to, receiver_cur + net_amount, &self.storage);
         state.add_gas(fee);
         true
     }
@@ -1199,8 +1379,8 @@ impl BalanceWriter{
             .collect();
         for (addr, share) in shares{
             let reward = (total_gas * share)/100;
-            let current = state.get_balance(&addr);
-            state.set_balance(addr,current+reward);
+            let current = state.get_balance(&addr, self.storage.clone());
+            state.set_balance(addr,current+reward, &self.storage);
         }
         ("[GAS]:가스비 분배 완료");
     }
@@ -1212,7 +1392,7 @@ impl BalanceWriter{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::block::{model_struct::*, transaction::TransactionData};
-use sha2::{Sha256, Digest};
+use sha3::{Keccak256, Digest};
 
 
 impl BlockData{
@@ -1268,7 +1448,7 @@ impl BlockData{
     }
 
     pub fn calculate_header_hash(header: &BlockHeader) -> Hash{
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         hasher.update(&header.prev_block_hash);
         hasher.update(&header.merkle_root);
         hasher.update(&header.timestamp.to_be_bytes());
