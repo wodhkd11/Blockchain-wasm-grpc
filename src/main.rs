@@ -1,83 +1,157 @@
 mod network;
-mod block; // 기존 블록 모듈
+mod block;
 mod crypto;
-use network::node::Node;
-use std::{env, net::SocketAddr, sync::Arc};
-use tokio::time::{sleep, Duration};
+mod exec;
 
-use crate::{ network::node::NodeManage};
+use std::{env, fs, sync::{Arc, OnceLock}};
+use once_cell::sync::Lazy;
+use serde::Deserialize;
+use network::node::NodeManage;
+
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    node: NodeConfig,
+    network: NetworkConfig,
+    storage: StorageConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeConfig {
+    ip_address: String,
+    port: u16,
+    rpc_port: u16, // RPC 포트 추가 (YAML에 있다고 가정)
+    wallet_address: String,
+    private: String,
+    node_type: String,
+    is_genesis: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkConfig {
+    boot_nodes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageConfig {
+    db_path: String,
+}
+
+static PRIVATE_KEY: OnceLock<[u8;32]> = OnceLock::new();
 
 #[tokio::main]
-async fn main() {
-    // 1. 명령줄 인자로 내 포트와 접속할 상대방 포트를 받는다고 가정합니다.
-    // 예: cargo run -- 8080 8081 (내 포트 8080, 접속할 상대 8081)
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 설정 파싱 (기존 로직 유지)
     let args: Vec<String> = env::args().collect();
+    let config_path = args.iter().position(|x| x == "--config")
+        .map(|pos| &args[pos + 1]).unwrap();
+    let yaml_str = fs::read_to_string(config_path)?;
+    let config: AppConfig = serde_yaml::from_str(&yaml_str)?;
+    let wallet_bytes = decode_address(&config.node.wallet_address);
+    let private_bytes = decode_private(&config.node.private);
+    PRIVATE_KEY.set(private_bytes).ok();
+    // 2. NodeManage 생성
+    let manager = Arc::new(NodeManage::new(
+        config.node.port,
+        &config.node.ip_address,
+        wallet_bytes,
+        &config.storage.db_path,
+        config.node.is_genesis,
+    ));
 
-    if args.len() < 2 {
-        println!("❌ 사용법: cargo run -- <내_포트> [시드_주소_1] [시드_주소_2] ...");
-        println!("예시: cargo run -- 9000 127.0.0.1:9001");
-        return;
-    }
-
-    // 2. 내 포트 설정
-    let my_port: u16 = args[1].parse().expect("포트 번호는 숫자여야 합니다.");
-    let my_addr_str = format!("127.0.0.1:{}", my_port);
-
-    let db_path = format!("data/node_{my_port}");
-
-    // 3. 시드 노드 주소들 추출 (2번째 인자부터 끝까지)
-    let seeds: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
-
-    println!("🚀 노드 가동 준비 중...");
-    println!("📍 내 주소: {}", my_addr_str);
-    println!("🌱 시드 노드 목록: {:?}", seeds);
+    // 3. 지저분한 spawn 다 치우고 딱 하나만 실행
+    println!("🚀 노드를 시작합니다 (포트: {})", config.node.port);
     
-    let wallet_str =  "9a88fba688549f107c6d97f8415f8eb6b6f76f98";
-    let mut wallet: [u8; 20] = [0;20];
-    hex::decode_to_slice(wallet_str, &mut wallet).expect("");
+    // manager.start 내부에 이미 miner, rpc, heartbeat 스폰 로직이 다 들어있으므로
+    // 여기서 start를 await 하면 내부 루프(listener.accept)까지 쭉 실행됩니다.
+    let seeds: Vec<&str> = config.network.boot_nodes.iter().map(|s| s.as_str()).collect();
+    manager.start(seeds).await;
 
-
-
-    // 4. NodeManage 생성 및 실행
-    let node_manager = Arc::new(NodeManage::new(my_port, &my_addr_str, wallet, &db_path));
-    
-    // start 함수가 내부적으로 Discovery를 수행하고 리스닝 루프를 돌립니다.
-    node_manager.start(seeds).await;
-    
-
-    /*블록체인관련되거 */
-    // let args: Vec<String> = std::env::args().collect();
-    // let my_port = args.get(1).expect("내 포트를 입력하세요 (예: 8080)");
-    // let target_port = args.get(2); // 접속할 상대방은 없을 수도 있음
-
-    // let my_addr = format!("127.0.0.1:{}", my_port);
-    // let node = Node::new(my_port.parse().unwrap() ,&my_addr);
-
-    // // 2. 내 노드 서버 시작 (비동기로 실행)
-    // let node_clone = std::sync::Arc::new(node);
-    // let node_for_start = node_clone.clone();
-    
-    // tokio::spawn(async move {
-    //     node_for_start.start().await;
-    // });
-
-    // // 서버가 뜰 때까지 잠깐 대기
-    // sleep(Duration::from_secs(1)).await;
-
-    // // 3. 만약 접속할 상대방 주소가 있다면 연결 시도
-    // if let Some(port) = target_port {
-    //     let target_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    //     node_clone.clone().connect_to_peer(target_addr).await;
-    // }
-
-    // // 4. 연결 유지 및 테스트 메시지 전송 루프
-    // loop {
-    //     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-    //     if node_clone.peers.read().await.len()>0{
-    //         println!("SEND TO ALL PEERS ...");
-    //         node_clone.broadcast(network::message::NetworkMessage::Ping).await;
-    //     }
-    //     // 여기서 나중에 node_clone.broadcast(...)를 테스트할 수 있습니다.
-    //     println!("현재 연결된 피어 수: {}", node_clone.peers.read().await.len());
-    // }
+    Ok(())
 }
+
+fn decode_address(addr: &str) -> [u8; 20] {
+    let clean_addr = addr.trim_start_matches("0x");
+    // 16진수 문자열은 20바이트일 때 길이가 40이어야 합니다.
+    if clean_addr.len() != 40 {
+        panic!("INVALID_ADDRESS_LENGTH: Expected 40 hex chars, got {}", clean_addr.len());
+    }
+    let mut bytes = [0u8; 20];
+    let decoded = hex::decode(clean_addr).expect("WRONG_WALLET_FORMAT");
+    bytes.copy_from_slice(&decoded);
+    bytes
+}
+
+
+fn decode_private(addr: &str) -> [u8; 32] {
+    let clean_addr = addr.trim_start_matches("0x");
+    // 16진수 문자열은 20바이트일 때 길이가 40이어야 합니다.
+    if clean_addr.len() != 64 {
+        panic!("INVALID_ADDRESS_LENGTH: Expected 40 hex chars, got {}", clean_addr.len());
+    }
+    let mut bytes = [0u8; 32];
+    let decoded = hex::decode(clean_addr).expect("WRONG_WALLET_FORMAT");
+    bytes.copy_from_slice(&decoded);
+    bytes
+}
+
+//mod network;
+//mod block; // 기존 블록 모듈
+//mod crypto;
+//mod exec;
+//use network::node::Node;
+//use serde::Deserialize;
+//use std::{env, fs, net::SocketAddr, sync::Arc};
+//use tokio::time::{sleep, Duration};
+
+//use crate::{ network::node::NodeManage};
+
+//#[derive(Debug, Deserialize)]
+//struct AppConfig{
+    //node: NodeConfig,
+    //network: NetworkConfig,
+    //storage: StorageConfig,
+//}
+//#[derive(Debug, Deserialize)]
+//struct NodeConfig{
+    //ip_address: String,
+    //port: u16,
+    //wallet_address: String,
+    //node_type: String,
+    //is_genesis: bool,
+//}
+//#[derive(Debug, Deserialize)]
+//struct NetworkConfig{boot_nodes: Vec<String>,}
+//#[derive(Debug, Deserialize)]
+//struct StorageConfig{db_path: String,}
+
+
+
+
+//#[tokio::main]
+//async fn main() {
+    //// 1. 명령줄 인자로 내 포트와 접속할 상대방 포트를 받는다고 가정합니다.
+    //// 예: cargo run -- 8080 8081 (내 포트 8080, 접속할 상대 8081)
+    //let args: Vec<String> = env::args().collect();
+    //let config_path = if let Some(pos) = args.iter().position(|x| x == "--config"){
+        //&args[pos + 1]
+    //}else{
+        //"config.yaml"
+    //};
+    //let yaml_str = fs::read_to_string(config_path)
+        //.expect("CONFIG_FILE_ERROR");
+    //let config: AppConfig = serde_yaml::from_str(&yaml_str)
+        //.expect("YAML_PARSING_ERROR");
+    //let wallet_bytes = decode_address(&config.node.wallet_address);
+
+
+    //// }
+//}
+
+//fn decode_address(addr:&str) -> [u8;20]{
+    //let clean_addr = addr.trim_start_matches("0x");
+    //if clean_addr.len() != 20 {panic!("INVALID_ADDRESS");}
+    //let mut bytes = [0u8;20];
+    //let decoded = hex::decode(clean_addr).expect("WRONG_WALLET_FORMAT");
+    //bytes.copy_from_slice(&decoded);
+    //bytes
+//}

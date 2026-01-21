@@ -5,7 +5,7 @@ pub mod signature;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use sha3::{Keccak256, Digest};
 
-use crate::block::model_struct::Address;
+use crate::block::types::Address;
 
 
 pub fn verify(
@@ -54,18 +54,21 @@ fn public_key_to_address(verifying_key: &VerifyingKey) -> [u8; 20]{
 }
 ==> ./src/network/message.rs <==
 use serde::{Serialize, Deserialize};
-use crate::block::{model_struct::BlockData, transaction::TransactionData};
+use crate::block::{types::BlockData, transaction::TransactionData};
 use std::net::SocketAddr;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage{
     Hello {listening_port: u16},
-    Transaction(TransactionData), //트랜잭션 전파
-    Block(BlockData), // 블록 전파
+    Status{chain_id: u64, best_height: u64, best_hash: [u8;32],},
+    NewTransaction(TransactionData), //트랜잭션 전파
+    NewBlock(BlockData), // 블록 전파
     GetPeers, //외부의 노드들에 대해 피어 공유 요청
     Peers(Vec<SocketAddr>), //보유한 노드들의 주소 공유
     Ping,
     Pong,
+    GetBlocks{request_id: u64, start_height: Option<u64>, count: Option<u64>,},
+    Inventory(Vec<BlockData>),
 }
 
 impl NetworkMessage{
@@ -112,6 +115,85 @@ impl NetworkMessage{
         hasher.finalize().to_vec()
     }
 }
+==> ./src/network/tasks/miner.rs <==
+use std::sync::Arc;
+use crate::{block::{transaction::ConfirmedTransaction, types::BlockData}, exec, network::{message::NetworkMessage, node::{Node, NodeManage}}};
+use tokio::{sync::RwLock, time::{Duration, sleep}};
+
+impl NodeManage{
+    pub async fn start_miner(self: Arc<Self>){
+
+        // 다른 노드들에 먼저 접속해서 최근 20개 블록 데이터? 를 받아와야함. 해시는 20개의 블록으로 하기
+        println!("[MINER]BOOTING MINER");
+        loop{
+            sleep(Duration::from_secs(4)).await;
+            let mut node_lock = self.state.write().await;
+            let my_address = node_lock.wallet;
+            let my_gov = node_lock.global_state.gov_shares.get(&my_address).cloned().unwrap_or(0);
+            let port = node_lock.port;
+            if port != 9000{
+                println!("PERMISSION DENIED ");
+                drop(node_lock);
+                continue;
+            }
+            //if my_gov == 0{
+                //println!("PERMISSION DENIED");
+                //drop(node_lock);
+                //continue;
+            //}// 이외에도 POS 등 로직 넣어줘야하는곳. 현재 내가 마이닝노드인지 확인 알고리즘 필요함.
+        
+            let mut valid_transactions = Vec::new();
+            let keys: Vec<_>  = node_lock.mempool.keys().cloned().take(100).collect();
+            let storage = node_lock.storage.clone();
+            let mut global_state = node_lock.global_state.clone();
+            for key in keys{
+                if let Some(tx) = node_lock.mempool.get(&key){
+                    if !tx.verify(){
+                        node_lock.mempool.remove(&key);
+                        continue;
+                    }
+                    match exec::apply_transaction(&mut global_state, tx, &storage){
+                        Ok(_) => {
+                            let tx_data = node_lock.mempool.remove(&key).unwrap();
+                            let sender = tx_data.sender;
+                            global_state.inc_nonce(&sender, &storage);
+                            let confirmed = ConfirmedTransaction::from(&tx_data);
+                            valid_transactions.push(confirmed);
+                        }
+                        Err(e) => {
+                            println!("[MINER]: Transaction Exec failed\nKey: {:?}\nErrorcode: {e}",key);
+                        }
+                    }
+                }
+            }
+            println!("[MINER]: New block generating: {} Transactions", valid_transactions.len());
+            node_lock.global_state.distribute_gas(&storage);
+        
+            let new_block = BlockData::new(
+                &node_lock.last_block,
+                valid_transactions,
+                my_address
+            );
+            node_lock.storage.commit_block(&new_block, &node_lock.global_state.balances, &node_lock.global_state);
+            let next_height = new_block.header.height;
+            let block_hash = new_block.hash;
+            node_lock.block_height = next_height;
+            node_lock.last_block = new_block.clone();
+            node_lock.global_state.balances.clear();
+            println!("\n====================");
+            println!("[MINER]: New block generated");
+            println!("Height: {}",next_height);
+            println!("Hash: {:?}",hex::encode(block_hash));
+            println!("\n====================\n");
+            let msg = NetworkMessage::NewBlock(new_block);
+            self.broadcast(msg);
+            drop(node_lock);
+
+        }
+    }
+
+
+}
 ==> ./src/network/tasks/gc.rs <==
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -140,6 +222,7 @@ impl NodeManage{
 pub mod gc;
 //pub mod generator;
 pub mod connection;
+pub mod miner;
 ==> ./src/network/tasks/connection.rs <==
 use std::sync::Arc;
 use std::net::SocketAddr;
@@ -166,7 +249,7 @@ impl NodeManage{
             
             // 접속 시도 대상 추출
             let targets: Vec<SocketAddr> = {
-                let state = self.state.read().await;
+                let state: tokio::sync::RwLockReadGuard<'_, crate::network::node::Node> = self.state.read().await;
                 state.unconnected_addrs.iter().cloned().collect()
             };
 
@@ -243,7 +326,7 @@ impl NodeManage{
 
 }
     */
-==> ./src/network/handler.rs <==
+==> ./src/network/connection/handler.rs <==
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -258,7 +341,7 @@ impl NodeManage{
 
     pub async fn handle_message(self: Arc<Self>, from_addr: SocketAddr, msg: NetworkMessage){
         let needs_gossip = match &msg{
-            NetworkMessage::Transaction(_) | NetworkMessage::Block(_) => true,
+            NetworkMessage::NewTransaction(_) | NetworkMessage::NewBlock(_) => true,
             _ => false,
         };
         if needs_gossip{
@@ -273,10 +356,10 @@ impl NodeManage{
 
         if needs_gossip{ println!("Received Message: {:?} from {}", msg, from_addr); }
         match msg{
-            NetworkMessage::Block(block) =>{
+            NetworkMessage::NewBlock(block) =>{
                 
             }
-            NetworkMessage::Transaction(tx) => {
+            NetworkMessage::NewTransaction(tx) => {
                 let sig_hash:[u8;32] = {
                     let mut hasher = Keccak256::new();
                     hasher.update(&tx.signature);
@@ -332,62 +415,8 @@ impl NodeManage{
         
     }
 }
-==> ./src/network/discovery.rs <==
-use std::{net::SocketAddr, sync::{Arc}};
-use crate::network::node::{NodeManage};
 
-
-pub struct DiscoveryManager {
-    seed_nodes: Vec<SocketAddr>,
-}
-
-impl DiscoveryManager{
-    pub fn new(seeds: Vec<&str>) -> Self{
-        let mut seed_nodes = Vec::new();
-        for s in seeds{
-            match s.parse::<SocketAddr>(){
-                Ok(addr) => seed_nodes.push(addr),
-                Err(e) => println!("Failed to parse seed address {s}(error: {e})")
-            }
-        }
-        Self{seed_nodes}
-    }
-    pub async fn boot(&self, manager: Arc<NodeManage>){
-        println!("Start booting with {} nodes", self.seed_nodes.len());
-        self.process_discovered_addrs(manager, self.seed_nodes.clone()).await;
-    }
-
-    pub async fn process_discovered_addrs(&self, manager: Arc<NodeManage>, addrs: Vec<SocketAddr>){
-        let (my_addr, already_connected) = {
-            let state = manager.state.read().await;
-            let my_addr = state.addr;
-            let connected_list: Vec<SocketAddr> = state.peers.keys().cloned().collect();
-            (my_addr, connected_list)
-        };
-
-        for addr in addrs{
-            if addr ==my_addr{continue;}
-            if already_connected.contains(&addr) {continue;}
-            let manager_clone = Arc::clone(&manager);
-            tokio::spawn(async move{
-                let manager_for_handler = Arc::clone(&manager_clone);
-                if let Ok(reader) = manager_clone.connect_to_peer(addr).await{
-                    manager_for_handler.handle_peer(addr,reader).await;
-                }
-            });
-        }
-
-
-    }
-
-    // pub async fn discover_new_peers(&self, received_addrs: Vec<SocketAddr>){
-    //     let mut state = self.state.write();
-    //     for addr in received_addrs{
-    //         if addr != state.addr
-    //     }
-    // }
-}
-==> ./src/network/server.rs <==
+==> ./src/network/connection/manager.rs <==
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, tcp::OwnedReadHalf}};
 use crate::network::{message::NetworkMessage, node::NodeManage, peer::Peer};
@@ -481,20 +510,120 @@ impl NodeManage{
         }
     }
 }
+
+==> ./src/network/connection/mod.rs <==
+pub mod manager;
+pub mod handler;
+
+==> ./src/network/discovery.rs <==
+use std::{net::SocketAddr, sync::{Arc}};
+use crate::network::node::{NodeManage};
+
+
+pub struct DiscoveryManager {
+    seed_nodes: Vec<SocketAddr>,
+}
+
+impl DiscoveryManager{
+    pub fn new(seeds: Vec<&str>) -> Self{
+        let mut seed_nodes = Vec::new();
+        for s in seeds{
+            match s.parse::<SocketAddr>(){
+                Ok(addr) => seed_nodes.push(addr),
+                Err(e) => println!("Failed to parse seed address {s}(error: {e})")
+            }
+        }
+        Self{seed_nodes}
+    }
+    pub async fn boot(&self, manager: Arc<NodeManage>){
+        println!("Start booting with {} nodes", self.seed_nodes.len());
+        self.process_discovered_addrs(manager, self.seed_nodes.clone()).await;
+    }
+
+    pub async fn process_discovered_addrs(&self, manager: Arc<NodeManage>, addrs: Vec<SocketAddr>){
+        let (my_addr, already_connected) = {
+            let state = manager.state.read().await;
+            let my_addr = state.addr;
+            let connected_list: Vec<SocketAddr> = state.peers.keys().cloned().collect();
+            (my_addr, connected_list)
+        };
+
+        for addr in addrs{
+            if addr ==my_addr{continue;}
+            if already_connected.contains(&addr) {continue;}
+            let manager_clone = Arc::clone(&manager);
+            tokio::spawn(async move{
+                let manager_for_handler = Arc::clone(&manager_clone);
+                if let Ok(reader) = manager_clone.connect_to_peer(addr).await{
+                    manager_for_handler.handle_peer(addr,reader).await;
+                }
+            });
+        }
+
+
+    }
+
+    // pub async fn discover_new_peers(&self, received_addrs: Vec<SocketAddr>){
+    //     let mut state = self.state.write();
+    //     for addr in received_addrs{
+    //         if addr != state.addr
+    //     }
+    // }
+}
+==> ./src/network/gossip/manager.rs <==
+use std::net::SocketAddr;
+
+use tokio::io::AsyncWriteExt;
+
+use crate::network::{message::NetworkMessage, node::NodeManage};
+
+impl NodeManage{
+
+    pub async fn relay_message(&self, exclude_addr: SocketAddr, msg:NetworkMessage){
+        let state=self.state.read().await;
+        for &addr in state.peers.keys(){
+            if addr == exclude_addr{continue;}
+            let manager_clone = self.clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move{
+                manager_clone.send_to(addr, msg_clone).await;
+            });
+        }
+    }
+
+    /**
+     * This function use when Your node is Miner
+     * Or you got data from out of BlockChain Nodes
+     */
+    pub async fn broadcast(&self, msg:NetworkMessage){
+        let bin = msg.encode();
+        let mut state = self.state.write().await;
+        for (_, peer) in state.peers.iter_mut(){
+            if let Some(ref mut writer) = peer.writer{
+                let _ = writer.write_all(&bin).await;
+            }
+        }
+    }
+
+}
+
+==> ./src/network/gossip/mod.rs <==
+pub mod manager;
+
 ==> ./src/network/mod.rs <==
 pub mod node;
 pub mod message;
 pub mod peer;
 pub mod discovery;
-pub mod handler;
-pub mod tasks;
+pub mod connection;
 pub mod gossip;
-pub mod server;
+pub mod tasks;
 pub mod rpc;
 ==> ./src/network/node.rs <==
 
 
 
+use once_cell::sync::Lazy;
 use tokio::net::{TcpListener};
 use tokio::sync::RwLock;
 use std::sync::Arc;
@@ -503,18 +632,22 @@ use std::net::{SocketAddr};
 use std::time::{Instant};
 //use crate::block::block_tester::run_block_tester;
 use crate::block::db::Storage;
-use crate::block::model_struct::{Hash};
-use crate::block::state::GlobalBalance;
+//use crate::block::genesis::GENESIS_BLOCK;
+use crate::block::types::{Address, BlockData, GlobalBalance, Hash};
 use crate::block::transaction::TransactionData;
 use crate::network::{discovery, rpc};
 use crate::network::peer::{Peer};
 
 //현재 노드가 어떤 상태인지를 담고 있다.
 // 현재 개방중인 포트, 내 IP주소, 나와 연결된 노드들의 정보를 담고 있다.
+pub static GENESIS_BLOCK: Lazy<BlockData> = Lazy::new(|| {
+    BlockData::create_genesis_block([0u8;20])
+});
 pub struct Node{ 
     pub port:u16,
     pub addr: SocketAddr,
-    pub wallet: [u8; 20],
+    pub wallet: Address,
+    pub chain_id: u64,
     pub peers: HashMap<SocketAddr, Peer>,
     pub unconnected_addrs: HashSet<SocketAddr>,
     pub max_peers: usize ,
@@ -522,6 +655,9 @@ pub struct Node{
     pub mempool: HashMap<Hash, TransactionData>, // 다음 블록이 생기기 이전까지 트랜잭션 저장 캐시 역할을 맡음. 
     pub global_state: GlobalBalance, //블록 생기기 전까지 잔액을 관리함
     pub storage: Arc<Storage>,
+
+    pub last_block: BlockData,
+    pub block_height: u64,
 }
 
 #[derive(Clone)]
@@ -531,20 +667,41 @@ pub struct NodeManage{
 impl NodeManage{
 
 
-    pub fn new(port:u16, addr: &str, wallet: [u8;20], path: &str) -> Self{
+    pub fn new(port:u16, addr: &str, wallet: [u8;20], path: &str, is_genesis: bool) -> Self{
+
         let node_addr = addr.parse().expect("INVALID ADDR");
+        let storage = Arc::new(Storage::new(path));
+        let last_block = if storage.is_empty(){
+            if is_genesis {
+                println!("I am genesis NODE");
+                let g = BlockData::create_genesis_block(wallet);
+                g
+            }else{
+                println!("[NODE]: Load Genesis setting");
+                GENESIS_BLOCK.clone()
+            }
+        } else{ storage.get_latest_block().unwrap() };
+        let block_height = last_block.header.height;
+        let global_state = GlobalBalance::new();
+        
+        let genesis = &*GENESIS_BLOCK;
+
+        println!("{:?}",genesis.hash) ;              
         Self { 
             state: Arc::new(RwLock::new(Node{
                 port,
                 addr: node_addr,
                 wallet: wallet,
+                chain_id: 6699,
                 peers: HashMap::new(),
                 unconnected_addrs: HashSet::new(),
                 max_peers: 100, // Default: 10, need to change
                 recent_seen_message: HashMap::new(),
                 mempool: HashMap::new(),
-                global_state: GlobalBalance::new(),
-                storage: Arc::new(Storage::new(path)),
+                global_state: global_state,
+                storage,
+                last_block: genesis.clone(),
+                block_height: 0,
             })),
          }
     }
@@ -564,7 +721,9 @@ impl NodeManage{
 
         let rc = Arc::clone(&manager);
         tokio::spawn(async move{rc.start_reconnector().await;});
-
+        
+        let mn = Arc::clone(&manager);
+        tokio::spawn(async move {mn.start_miner().await;});
         //let tester = Arc::clone(&self);
         //tokio::spawn(async move{run_block_tester(tester).await;});
 
@@ -627,42 +786,6 @@ impl NodeManage{
 
 
 
-==> ./src/network/gossip.rs <==
-use std::net::SocketAddr;
-
-use tokio::io::AsyncWriteExt;
-
-use crate::network::{message::NetworkMessage, node::NodeManage};
-
-impl NodeManage{
-
-    pub async fn relay_message(&self, exclude_addr: SocketAddr, msg:NetworkMessage){
-        let state=self.state.read().await;
-        for &addr in state.peers.keys(){
-            if addr == exclude_addr{continue;}
-            let manager_clone = self.clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move{
-                manager_clone.send_to(addr, msg_clone).await;
-            });
-        }
-    }
-
-    /**
-     * This function use when Your node is Miner
-     * Or you got data from out of BlockChain Nodes
-     */
-    pub async fn broadcast(&self, msg:NetworkMessage){
-        let bin = msg.encode();
-        let mut state = self.state.write().await;
-        for (_, peer) in state.peers.iter_mut(){
-            if let Some(ref mut writer) = peer.writer{
-                let _ = writer.write_all(&bin).await;
-            }
-        }
-    }
-
-}
 ==> ./src/network/peer.rs <==
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -724,12 +847,37 @@ impl Peer{
 use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{post, get}};
 use reqwest::Method;
 use serde::Deserialize;
+use serde_json::json;
 use serde_with::serde_as;
 use sha3::{Digest, Keccak256};
 use tower_http::cors::{Any, CorsLayer};
 use std::sync::Arc;
-use crate::{block::{model_struct::Hash, transaction::TransactionData}, network::{message::NetworkMessage, node::NodeManage}};
+use crate::{block::{types::Hash, transaction::TransactionData}, network::{message::NetworkMessage, node::NodeManage}};
 use hex;
+
+#[derive(Deserialize)]
+struct RpcRequest{
+    method: String,
+    params: Vec<serde_json::Value>,
+    id: serde_json::Value,
+}
+
+async fn handle_eth_request(
+    State(manager): State<Arc<NodeManage>>,
+    Json(req): Json<RpcRequest>,
+) -> impl IntoResponse{
+    match req.method.as_str(){
+        "eth_chainId" => {
+            let hex_chain_id = format!("0x{:x}", 555);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "result": hex_chain_id
+            }))
+        },
+        _ => Json(json!({"jsonrpc": "2.0", "id": req.id, "error": "Method NOt FOund"})),
+    }.into_response()
+}
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -751,7 +899,7 @@ pub async fn start_rpc_server(manager: Arc<NodeManage>, rpc_port: u16){
 
     let app = Router::new()
         .route("/transaction", post(handle_tx_submission))
-        .route("/nonce/:address", get(get_nonce_handler))
+        .route("/nonce/{address}", get(get_nonce_handler))
         .layer(cors)
         .with_state(manager);
     let addr = format!("0.0.0.0:{}", rpc_port);
@@ -772,28 +920,28 @@ async fn handle_tx_submission(
     let mut hasher = Keccak256::new();
     hasher.update(&payload.signature);
     let sig_hash: [u8; 32] = hasher.finalize().into();
-
     let tx = payload.to_core_data().ok_or(StatusCode::UNAUTHORIZED)?;
-
+    let tx_id = tx.calculate_hash();
     let sender_address = tx.sender;
+
     {
         let mut state = manager.state.write().await;
         let storage = state.storage.clone();
         let storage_clone = storage.clone();
-        let cur_nonce = state.global_state.get_nonce(&sender_address, storage);
-        if tx.nonce!= cur_nonce{
-            println!("[RPC]: Nonce mismatch");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        if state.mempool.contains_key(&sig_hash){
-            return Err(StatusCode::CONFLICT);
-        }
-        state.mempool.insert(sig_hash, tx.clone());
-
-        state.global_state.increase_nonce_only(tx.sender, storage_clone);
+        let _ = match state.global_state.check_nocne(&sender_address, tx.nonce, &storage_clone){
+            true => {
+                if state.mempool.contains_key(&sig_hash){ return Err(StatusCode::CONFLICT); }
+                state.mempool.insert(tx_id, tx.clone());               
+            },
+            false => {
+                println!("[RPC]: Nonce mismatch");
+                return Err(StatusCode::BAD_REQUEST);
+            },
+        };
+        //Commit 시 해야됨 state.global_state.increase_nonce_only(tx.sender, storage_clone);
         
     }
-    let msg = NetworkMessage::Transaction(tx.clone());
+    let msg = NetworkMessage::NewTransaction(tx.clone());
     let manager_clone = manager.clone();
     
 
@@ -807,8 +955,8 @@ async fn get_nonce_handler(
 ) -> impl IntoResponse{
     let address = hex_to_address(&address);
     let mut manager_clone = manager.state.write().await;
-    let db_addr = manager_clone.storage.clone();
-    let nonce = manager_clone.global_state.get_nonce(&address, db_addr);
+    let storage = manager_clone.storage.clone();
+    let nonce = manager_clone.global_state.get_nonce(&address, &storage);
     Json(nonce)
 }
 
@@ -848,96 +996,418 @@ impl TransactionRequest{
         crate::crypto::signature::verify(self.sender, &self.signature, &v)
     }
 }
-==> ./src/main.rs <==
-mod network;
-mod block; // 기존 블록 모듈
-mod crypto;
-use network::node::Node;
-use std::{env, net::SocketAddr, sync::Arc};
-use tokio::time::{sleep, Duration};
+==> ./src/exec/handler/token.rs <==
+use std::sync::Arc;
+use crate::{block::{db::Storage, types::{Address, GlobalBalance}}, exec::{RawPayload, schema::*}};
 
-use crate::{ network::node::NodeManage};
 
-#[tokio::main]
-async fn main() {
-    // 1. 명령줄 인자로 내 포트와 접속할 상대방 포트를 받는다고 가정합니다.
-    // 예: cargo run -- 8080 8081 (내 포트 8080, 접속할 상대 8081)
-    let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        println!("❌ 사용법: cargo run -- <내_포트> [시드_주소_1] [시드_주소_2] ...");
-        println!("예시: cargo run -- 9000 127.0.0.1:9001");
-        return;
+pub fn handle_transfer(
+    state: &mut GlobalBalance,
+    from: Address,
+    to: Address,
+    value: u64,
+    fee: u64,
+    params: serde_json::Value,
+    db: &Storage
+) -> Result<(), String>{
+    let json_params:TransferParams = serde_json::from_value(params).expect("JSON PARSING FAILED");
+    let token = &json_params.token_symbol;
+    if !state.token_metadata.contains_key(token){
+        return Err("Unsupported token".into());
+    }
+    let fee = 100 as u64;
+    let krw_balance = state.get_token_balance(&from, &"KRW".into(), db);
+    if token == "KRW" {
+        if krw_balance < value.saturating_add(fee){
+            return Err("INSUFFICIENT_KRW".into());
+        }
+    }else{
+        if krw_balance < fee{
+            return Err("INSUFFICIENT_GAS".into());
+        }
+        let token_balance = state.get_token_balance(&from, token, db);
+        if token_balance < value{
+            return Err(format!("INSUFFICIENT_{token}_BALANCE"));
+        }
     }
 
-    // 2. 내 포트 설정
-    let my_port: u16 = args[1].parse().expect("포트 번호는 숫자여야 합니다.");
-    let my_addr_str = format!("127.0.0.1:{}", my_port);
+    state.pay_gas(&from, fee, db);
+    match state.sub_balance(&from, token, value, db){
+        Ok(()) => state.add_balance(&to, &token, value, db),
+        Err(e) => return Err(e),
+    }
 
-    let db_path = format!("data/node_{my_port}");
-
-    // 3. 시드 노드 주소들 추출 (2번째 인자부터 끝까지)
-    let seeds: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
-
-    println!("🚀 노드 가동 준비 중...");
-    println!("📍 내 주소: {}", my_addr_str);
-    println!("🌱 시드 노드 목록: {:?}", seeds);
+    Ok(())
     
-    let wallet_str =  "9a88fba688549f107c6d97f8415f8eb6b6f76f98";
-    let mut wallet: [u8; 20] = [0;20];
-    hex::decode_to_slice(wallet_str, &mut wallet).expect("");
+}
+
+==> ./src/exec/handler/system.rs <==
+//보안 중요함
+
+//기존 토큰의 메타데이터에 수정자로 접근이 가능하므로, 덮어쓰기도 못하게 하는 등 여러 보안 필요
+
+use std::sync::Arc;
+
+use rocksdb::statistics::Ticker;
+
+use crate::{block::{db::Storage, types::{Address, GlobalBalance, TokenInfo}}, exec::schema::RegisterTokenParams};
 
 
+/**
+ * param input:
+ * pub name: String,
+ * pub symbol: TokenTicker,
+ * pub admin: Address,
+ * pub initial_supply: u64, 
+ * pub decimals: u8,
 
-    // 4. NodeManage 생성 및 실행
-    let node_manager = Arc::new(NodeManage::new(my_port, &my_addr_str, wallet, &db_path));
+ */
+pub fn register_token(
+    state: &mut GlobalBalance,
+    from: Address,
+    to: Address, //None 0
+    value: u64, //None 0
+    fee: u64,
+    params: serde_json::Value,
+    db: &Storage
+) -> Result<(), String>{
+    let json_params: RegisterTokenParams = serde_json::from_value(params).expect("INVALID_JSON");
     
-    // start 함수가 내부적으로 Discovery를 수행하고 리스닝 루프를 돌립니다.
-    node_manager.start(seeds).await;
+    let ticker = json_params.symbol.to_uppercase();
+    if !state.gov_shares.contains_key(&from){return Err("PERMISSION_DENIED".into());}
+    let threshold = 20 as u64;
+    if state.gov_shares.get(&from).unwrap() < &threshold {return Err("THRESHOLD_ERROR".into());}
+    if state.token_metadata.contains_key(&ticker){
+        return Err(format!("TOKEN_ALREADY_EXISTS_{ticker}"));
+    }
+    if ticker.len() < 2 || ticker.len() > 10 || !ticker.chars().all(|c| c.is_alphabetic()){
+        return Err("INVALID_TOKEN_TICKER_FORMAT".into());
+    }
+    let new_metadata = TokenInfo::new(
+        &json_params.name,
+        &ticker,
+        json_params.decimals,
+        json_params.initial_supply,
+        to,
+    );
+    state.pay_gas(&from, fee, db)?;
+    state.token_metadata.insert(ticker.clone(),new_metadata);
+    state.add_balance(&to, &ticker, value, db);
+    println!("[NEW TOKEN] Registered: {ticker} by {}", hex::encode(from));
+    Ok(())
+}
+
+
+==> ./src/exec/handler/mod.rs <==
+pub mod system;
+pub mod token;
+pub mod burn;
+pub mod mint;
+
+
+
+
+==> ./src/exec/handler/mint.rs <==
+
+==> ./src/exec/handler/burn.rs <==
+
+==> ./src/exec/opcodes.rs <==
+pub const OP_SYSTEM_REGISTER_TOKEN: u8 = 0x00;
+pub const OP_TOKEN_MINT: u8 = 0x01;
+pub const OP_TOKEN_TRANSFER: u8 = 0x02;
+pub const OP_TOKEN_BURN: u8 = 0x03;
+pub const OP_PAY_PURCHASE: u8 = 0x04;
+
+
+//...추가 필요
+
+==> ./src/exec/decoder.rs <==
+
+
+
+
+
+//작성 필요
+
+==> ./src/exec/mod.rs <==
+
+pub mod decoder;
+mod opcodes;
+pub mod schema;
+pub mod handler;
+
+
+
+use std::sync::Arc;
+
+use serde::Deserialize;
+
+use crate::{block::{db::Storage, transaction::TransactionData, types::{GlobalBalance, TokenInfo}}, exec::{handler::{system::register_token, token::handle_transfer}, opcodes::*, schema::*}};
+
+pub enum Instruction{
+    RegisterToken(RegisterTokenParams),
+    Transfer(TransferParams),
+    Mint,
+    Burn,
+
+}
+
+/*
+pub const OP_SYSTEM_REGISTER_TOKEN: u8 = 0x00;
+pub const OP_TOKEN_MINT: u8 = 0x01;
+pub const OP_TOKEN_TRANSFER: u8 = 0x02;
+pub const OP_TOKEN_BURN: u8 = 0x03;
+pub const OP_PAY_PURCHASE: u8 = 0x04;
+ */
+#[derive(Deserialize)]
+pub struct RawPayload{
+    pub opcode: u8,
+    pub fee: u64,
+    pub data: serde_json::Value,
+}
+
+pub fn apply_transaction(state: &mut GlobalBalance, tx: &TransactionData, db:&Storage) -> Result<(), String>{
+    let raw_payload: RawPayload = serde_json::from_slice(&tx.payload)
+        .map_err(|_| "Invalid Payload JSON")?;
+    let opcode = raw_payload.opcode;
+    let fee = raw_payload.fee;
+    match opcode{
+        OP_SYSTEM_REGISTER_TOKEN => {
+            register_token(state, tx.sender, tx.receiver, tx.value, fee, raw_payload.data, &db)
+        },
+        OP_TOKEN_TRANSFER => {
+            handle_transfer(state, tx.sender, tx.receiver, tx.value, fee, raw_payload.data, &db)
+        }
+        // OP_TOKEN_MINT =>{
+        // }
+
+        _ => Err("OP NOT FOUND".to_string())
+    }
+}
+==> ./src/exec/schema.rs <==
+use serde::{Deserialize, Serialize};
+
+use crate::block::types::{Address, TokenTicker};
+
+
+
+#[derive(Deserialize, Serialize)]
+pub struct RegisterTokenParams{
+    pub name: String,
+    pub symbol: TokenTicker,
+    pub admin: Address,
+    pub initial_supply: u64, //
+    pub decimals: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct TransferParams{ //전이할 데이터: 토큰과 값, from과 to는 transaction에 존재
+    pub token_symbol: TokenTicker,
+}
+
+//pub fn MintParams{}
+//pub fn BurnParams{}
+
+==> ./src/main.rs <==
+mod network;
+mod block;
+mod crypto;
+mod exec;
+
+use std::{env, fs, sync::Arc};
+use serde::Deserialize;
+use network::node::NodeManage;
+
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    node: NodeConfig,
+    network: NetworkConfig,
+    storage: StorageConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeConfig {
+    ip_address: String,
+    port: u16,
+    rpc_port: u16, // RPC 포트 추가 (YAML에 있다고 가정)
+    wallet_address: String,
+    node_type: String,
+    is_genesis: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkConfig {
+    boot_nodes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageConfig {
+    db_path: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 설정 파싱 (기존 로직 유지)
+    let args: Vec<String> = env::args().collect();
+    let config_path = args.iter().position(|x| x == "--config")
+        .map(|pos| &args[pos + 1]).unwrap();
+
+    let yaml_str = fs::read_to_string(config_path)?;
+    let config: AppConfig = serde_yaml::from_str(&yaml_str)?;
+    let wallet_bytes = decode_address(&config.node.wallet_address);
+
+    // 2. NodeManage 생성
+    let manager = Arc::new(NodeManage::new(
+        config.node.port,
+        &config.node.ip_address,
+        wallet_bytes,
+        &config.storage.db_path,
+        config.node.is_genesis,
+    ));
+
+    // 3. 지저분한 spawn 다 치우고 딱 하나만 실행
+    println!("🚀 노드를 시작합니다 (포트: {})", config.node.port);
     
+    // manager.start 내부에 이미 miner, rpc, heartbeat 스폰 로직이 다 들어있으므로
+    // 여기서 start를 await 하면 내부 루프(listener.accept)까지 쭉 실행됩니다.
+    let seeds: Vec<&str> = config.network.boot_nodes.iter().map(|s| s.as_str()).collect();
+    manager.start(seeds).await;
 
-    /*블록체인관련되거 */
-    // let args: Vec<String> = std::env::args().collect();
-    // let my_port = args.get(1).expect("내 포트를 입력하세요 (예: 8080)");
-    // let target_port = args.get(2); // 접속할 상대방은 없을 수도 있음
+    Ok(())
+}
 
-    // let my_addr = format!("127.0.0.1:{}", my_port);
-    // let node = Node::new(my_port.parse().unwrap() ,&my_addr);
+fn decode_address(addr: &str) -> [u8; 20] {
+    let clean_addr = addr.trim_start_matches("0x");
+    // 16진수 문자열은 20바이트일 때 길이가 40이어야 합니다.
+    if clean_addr.len() != 40 {
+        panic!("INVALID_ADDRESS_LENGTH: Expected 40 hex chars, got {}", clean_addr.len());
+    }
+    let mut bytes = [0u8; 20];
+    let decoded = hex::decode(clean_addr).expect("WRONG_WALLET_FORMAT");
+    bytes.copy_from_slice(&decoded);
+    bytes
+}
 
-    // // 2. 내 노드 서버 시작 (비동기로 실행)
-    // let node_clone = std::sync::Arc::new(node);
-    // let node_for_start = node_clone.clone();
-    
-    // tokio::spawn(async move {
-    //     node_for_start.start().await;
-    // });
 
-    // // 서버가 뜰 때까지 잠깐 대기
-    // sleep(Duration::from_secs(1)).await;
+//mod network;
+//mod block; // 기존 블록 모듈
+//mod crypto;
+//mod exec;
+//use network::node::Node;
+//use serde::Deserialize;
+//use std::{env, fs, net::SocketAddr, sync::Arc};
+//use tokio::time::{sleep, Duration};
 
-    // // 3. 만약 접속할 상대방 주소가 있다면 연결 시도
-    // if let Some(port) = target_port {
-    //     let target_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    //     node_clone.clone().connect_to_peer(target_addr).await;
-    // }
+//use crate::{ network::node::NodeManage};
 
-    // // 4. 연결 유지 및 테스트 메시지 전송 루프
-    // loop {
-    //     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-    //     if node_clone.peers.read().await.len()>0{
-    //         println!("SEND TO ALL PEERS ...");
-    //         node_clone.broadcast(network::message::NetworkMessage::Ping).await;
-    //     }
-    //     // 여기서 나중에 node_clone.broadcast(...)를 테스트할 수 있습니다.
-    //     println!("현재 연결된 피어 수: {}", node_clone.peers.read().await.len());
-    // }
+//#[derive(Debug, Deserialize)]
+//struct AppConfig{
+    //node: NodeConfig,
+    //network: NetworkConfig,
+    //storage: StorageConfig,
+//}
+//#[derive(Debug, Deserialize)]
+//struct NodeConfig{
+    //ip_address: String,
+    //port: u16,
+    //wallet_address: String,
+    //node_type: String,
+    //is_genesis: bool,
+//}
+//#[derive(Debug, Deserialize)]
+//struct NetworkConfig{boot_nodes: Vec<String>,}
+//#[derive(Debug, Deserialize)]
+//struct StorageConfig{db_path: String,}
+
+
+
+
+//#[tokio::main]
+//async fn main() {
+    //// 1. 명령줄 인자로 내 포트와 접속할 상대방 포트를 받는다고 가정합니다.
+    //// 예: cargo run -- 8080 8081 (내 포트 8080, 접속할 상대 8081)
+    //let args: Vec<String> = env::args().collect();
+    //let config_path = if let Some(pos) = args.iter().position(|x| x == "--config"){
+        //&args[pos + 1]
+    //}else{
+        //"config.yaml"
+    //};
+    //let yaml_str = fs::read_to_string(config_path)
+        //.expect("CONFIG_FILE_ERROR");
+    //let config: AppConfig = serde_yaml::from_str(&yaml_str)
+        //.expect("YAML_PARSING_ERROR");
+    //let wallet_bytes = decode_address(&config.node.wallet_address);
+
+
+    //// }
+//}
+
+//fn decode_address(addr:&str) -> [u8;20]{
+    //let clean_addr = addr.trim_start_matches("0x");
+    //if clean_addr.len() != 20 {panic!("INVALID_ADDRESS");}
+    //let mut bytes = [0u8;20];
+    //let decoded = hex::decode(clean_addr).expect("WRONG_WALLET_FORMAT");
+    //bytes.copy_from_slice(&decoded);
+    //bytes
+//}
+==> ./src/block/types.rs <==
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+// Type aliases
+pub type Address = [u8; 20];
+pub type Hash = [u8; 32];
+pub type Signature = Vec<u8>;
+pub type TokenTicker = String;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TokenInfo{
+    pub name: String,
+    pub symbol: TokenTicker,
+    pub decimals: u8,
+    pub total_supply: u64,
+    pub admin: Address,
+}
+// Block types
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockHeader{
+    pub height: u64,
+    pub prev_block_hash: Hash,
+    pub merkle_root: Hash,
+    pub timestamp: u64,
+    pub valdiator: Address,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockData{
+    pub header: BlockHeader,
+    pub body: Vec<crate::block::transaction::ConfirmedTransaction>,
+    pub hash: Hash,
+    pub signature: Signature,
+}
+
+// Account and Balance types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account{
+    pub balance: HashMap<TokenTicker, u64>, //Symbol, value
+    pub nonce: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalBalance{
+    pub balances: HashMap<Address, Account>,
+    pub gov_shares: HashMap<Address, u64>,
+    pub gas_pool: u64,
+    pub token_metadata: HashMap<TokenTicker, TokenInfo>,
 }
 
 ==> ./src/block/transaction.rs <==
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use sha3::{Digest, Keccak256};
-use crate::{block::model_struct::{Address, Hash}, crypto::signature};
+use crate::{block::types::{Address, Hash}, crypto::signature};
 
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -998,13 +1468,7 @@ impl TransactionData{
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfirmedTransaction{
-    pub sender: Address,
-    pub receiver: Address,
-    pub value: u64,
-    pub nonce: u64, // 이중지불 방지용 트랜잭션 순서
-    pub payload: Vec<u8>,
-    #[serde_as(as = "[_; 65]")]
-    pub signature: [u8; 65],
+    pub tx_info: TransactionData,
     pub hash: Hash,
 }
 
@@ -1016,16 +1480,52 @@ impl ConfirmedTransaction{
     pub fn from(tx: &TransactionData) -> Self{
         let tx_hash = tx.calculate_hash();
         Self{
-            sender: tx.sender,
-            receiver: tx.receiver,
-            value: tx.value,
-            payload: tx.payload.clone(),
-            nonce: tx.nonce,
-            signature: tx.signature,
+            tx_info: tx.clone(),
             hash: tx_hash,
         }
     }
 
+}
+
+pub struct TransactionForDB{
+    pub tx_info: TransactionData,
+    pub hash: Hash,
+    pub block_height: u64,
+    pub block_hash: Hash,
+    pub index: u64,
+}
+
+impl TransactionForDB{
+    /**
+     * This function gets TransactionData 
+     * and returns ConfirmedTransaction
+     */
+    pub fn from(tx: &TransactionData, block_height: u64, block_hash: Hash, idx: u64) -> Self{
+        let tx_hash = tx.calculate_hash();
+        Self{
+            tx_info: tx.clone(),
+            hash: tx_hash,
+            block_height,
+            block_hash,
+            index: idx,
+        }
+    }
+
+}
+==> ./src/block/asset.rs <==
+use crate::block::types::{Address, TokenInfo};
+
+
+impl TokenInfo{
+    pub fn new(name: &str, symbol: &str, decimals: u8, total_supply: u64, admin: Address) -> Self{
+        Self{
+            name: name.to_string(),
+            symbol: symbol.to_string(),
+            decimals,
+            total_supply,
+            admin,
+        }
+    }
 }
 ==> ./src/block/block_tester.rs <==
 //use std::{sync::Arc, time::Duration};
@@ -1091,9 +1591,18 @@ impl ConfirmedTransaction{
 ==> ./src/block/db.rs <==
 use std::collections::HashMap;
 
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use sha3::digest::block_buffer::Block;
 
-use crate::block::{model_struct::{Address, BlockData, Hash}, state::Account};
+use crate::block::{genesis::DECIMALS, types::{Account, Address, BlockData, GlobalBalance, Hash, TokenInfo}};
+
+const PREFIX_BLOCK: u8 = b'b';
+const PREFIX_INDEX: u8 = b'i';
+const PREFIX_ACCOUNT: u8 = b'a';
+const PREFIX_TOKEN: u8 = b't';
+const PREFIX_GLOBAL_STATE: u8 = b'g';
+const PREFIX_STAKER: u8 = b's';
+const KEY_LAST_BLOCK: &[u8] = b"last_block";
 
 
 pub struct Storage{
@@ -1108,304 +1617,269 @@ impl Storage{
         Self {db}
     }
 
-    fn acc_key(address: &Address) -> Vec<u8>{
-        let mut key = b"acc_".to_vec();
-        key.extend_from_slice(address);
-        key
-    }
-    fn blk_key(hash: &Hash) -> Vec<u8>{
-        let mut key = b"blk_".to_vec();
+    fn blk_key(hash: &Hash) -> Vec<u8> {
+        let mut key = vec![PREFIX_BLOCK];
         key.extend_from_slice(hash);
         key
     }
-    fn idx_key(height: u64) -> String{
-        format!("idx_{height}")
+    fn idx_key(height: u64) -> Vec<u8> {
+        let mut key = vec![PREFIX_INDEX];
+        key.extend_from_slice(&height.to_be_bytes());
+        key
+    }
+    fn acc_key(addr: &Address) -> Vec<u8> {
+        let mut key = vec![PREFIX_ACCOUNT];
+        key.extend_from_slice(addr);
+        key
+    }
+    fn staker_key(addr: &Address) -> Vec<u8>{
+        let mut key = vec![PREFIX_STAKER];
+        key.extend_from_slice(addr);
+        key
+    }
+    fn token_key(id:u32) -> Vec<u8> {
+        let mut key = vec![PREFIX_TOKEN];
+        key.extend_from_slice(&id.to_be_bytes());
+        key
     }
 
-
-    pub fn is_exist(&self, address: &Address) -> bool{
-        self.db.key_may_exist(address) &&self.db.get(address).ok().flatten().is_some()
+    pub fn put_global_state(&self, state: &GlobalBalance){
+        let bytes = postcard::to_allocvec(state).expect("GlobalState serialize failed");
+        self.db.put(vec![PREFIX_GLOBAL_STATE],bytes).expect("DB write failed");
+    }
+    pub fn get_global_state(&self) -> Option<GlobalBalance>{
+        let data = self.db.get(vec![PREFIX_GLOBAL_STATE]).ok().flatten()?;
+        postcard::from_bytes(&data).ok()
     }
 
-    pub fn get_account(&self, address: &Address) -> Option<Account>{
+    pub fn put_staker(&self, addr: &Address, amount: u64){
+        let key = Self::staker_key(addr);
+        self.db.put(key, amount.to_be_bytes()).expect("Staker Save Failed");
+    }
+    pub fn get_all_stakers(&self) -> (Vec<(Address, u64)>, u64){
+        let mut stakers = Vec::new();
+        let mut total_stake = 0u64;
+        let mode = IteratorMode::From(&[PREFIX_STAKER], rocksdb::Direction::Forward);
+        let iter = self.db.iterator(mode);
+        for item in iter{
+            if let Ok((key, value)) = item{
+                if key.is_empty() || key[0] != PREFIX_STAKER {break;}
+                let mut addr = [0u8;20];
+                addr.copy_from_slice(&key[1..21]);
+                let mut amount_bytes = [0u8;8];
+                amount_bytes.copy_from_slice(&value);
+                let amount = u64::from_be_bytes(amount_bytes);
+                stakers.push((addr,amount));
+                total_stake += amount;
+            }
+        }
+        (stakers, total_stake)
+    }
+
+    pub fn get_account(&self, address: &Address) -> Account{
         let key = Self::acc_key(address);
-        match self.db.get(key).expect("DB read failed"){
-            Some(bytes) => Some(postcard::from_bytes(&bytes).expect("Account deserialize failed")),
-            None => None,
-        }        
+        self.db.get(key).ok().flatten()
+            .and_then(|bytes| postcard::from_bytes(&bytes).ok())
+            .unwrap_or(Account { balance: HashMap::new() , nonce: 0u64 })
     }
-
-    pub fn put_account(&self, address: &Address, account: &Account){
-        let key = Self::acc_key(address);
-        let bytes = postcard::to_allocvec(account).expect("Account serialzied failed");
-        self.db.put(key, bytes).expect("DB write failed");
-    }
-
     pub fn get_block(&self, hash: &Hash) -> Option<BlockData>{
         let key = Self::blk_key(hash);
-        match self.db.get(key).expect("DB block read failed"){
-            Some(bytes) => Some(postcard::from_bytes(&bytes).expect("Block deserialize failed")),
-            None => None,
-        }
+        let data = self.db.get(key).ok().flatten()?;
+        postcard::from_bytes(&data).ok()
     }
-
-    pub fn get_hash_by_height(&self, height: u64) -> Option<Hash>{
+    pub fn get_block_by_height(&self, height: u64) -> Option<BlockData>{
+        let hash = self.get_hash_by_height(height)?;
+        self.get_block(&hash)
+    }
+    pub fn get_hash_by_height(&self, height:u64) -> Option<Hash>{
         let key = Self::idx_key(height);
-        match self.db.get(key.as_bytes()).expect("DB index read failed"){
-            Some(bytes) => {
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&bytes);
-                Some(hash)
-            }
-            None => None,
-        }
+        let bytes = self.db.get(key).ok().flatten()?;
+        let mut hash = [0u8;32];
+        hash.copy_from_slice(&bytes);
+        Some(hash)
+    }
+    pub fn get_latest_block(&self) -> Option<BlockData>{
+        let last_hash_bytes = self.db.get(KEY_LAST_BLOCK).ok().flatten()?;
+        let mut last_hash = [0u8;32];
+        last_hash.copy_from_slice(&last_hash_bytes);
+        self.get_block(&last_hash)
     }
 
-    pub fn commit_block(&self, block: &BlockData, state_update: &HashMap<Address, Account>){
+    pub fn commit_block(&self, block: &BlockData, state_update: &HashMap<Address, Account>, global_state: &GlobalBalance){
         let mut batch = WriteBatch::default();
-
+        //hash - block data
         let blk_key = Self::blk_key(&block.hash);
-        let blk_bytes = postcard::to_allocvec(block).expect("Block serialize failed");
+        let blk_bytes = postcard::to_allocvec(block).expect("Block Serialize Failed");
         batch.put(blk_key, blk_bytes);
-
+        
+        //height - block hash 
         let idx_key = Self::idx_key(block.header.height);
-        batch.put(idx_key.as_bytes(), block.hash);
+        batch.put(idx_key, block.hash);
+
+        //KEY_LAST_BLOCK은 최신의 블록 해시 하나의 값만 가짐
+        batch.put(KEY_LAST_BLOCK, block.hash);
 
         for (addr, acc) in state_update{
             let acc_key = Self::acc_key(addr);
-            let acc_bytes = postcard::to_allocvec(acc).expect("Acocunt serialize failed");
+            let acc_bytes = postcard::to_allocvec(acc).expect("Account Serialize Failed");
             batch.put(acc_key, acc_bytes);
+
+            if let Some(&gov_amount) = global_state.gov_shares.get(addr){
+                if gov_amount > 0{
+                    let s_key = Self::staker_key(addr);
+                    batch.put(s_key, gov_amount.to_be_bytes());
+                } else{
+                    let s_key = Self::staker_key(addr);
+                    batch.delete(s_key);
+                }
+            }
         }
-        
-        self.db.write(batch).expect("Atomic block commit failed");
+
+        let gs_bytes = postcard::to_allocvec(global_state).expect("Globalstate Serialize Failed");
+        batch.put(vec![PREFIX_GLOBAL_STATE], gs_bytes);
+        self.db.write(batch).expect("Block Commit Failed");
+    }
+
+    pub fn is_empty(&self) -> bool{
+        self.db.get(KEY_LAST_BLOCK).ok().flatten().is_none()
     }
 
 }
-==> ./src/block/model_struct.rs <==
-use serde::{Deserialize, Serialize};
+==> ./src/block/balance.rs <==
 
-use crate::block::transaction::TransactionData;
+use std::collections::HashMap;
 
-pub type Address = [u8; 20];
-pub type Hash = [u8; 32];
+use crate::block::db::Storage;
+use crate::block::types::{Account, Address, GlobalBalance, TokenTicker};
 
 
-pub type Signature = Vec<u8>;
+/// 여기서 상태 전이 함수를 정의해야함.
+impl GlobalBalance{
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BlockHeader{
-    pub height: u64,
-    pub prev_block_hash: Hash,
-    pub merkle_root: Hash,
-    pub timestamp: u64,
-    pub valdiator: Address,
-}
+    pub fn new() -> Self{
+        let gov_shares = HashMap::new();
+        let balances = HashMap::new();
+        Self{
+            balances,
+            gov_shares,
+            gas_pool: 0,
+            token_metadata: HashMap::new(),
+        }
+    }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BlockData{
-    pub header: BlockHeader,
-    pub body: Vec<TransactionData>,
-    pub hash: Hash,
-    pub signature: Signature,
+
+
+    //methods
+    fn get_account_mut(&mut self, address: &Address, db:&Storage) -> &mut Account{
+        self.balances.entry(*address).or_insert_with(||{
+            db.get_account(address)
+        })
+    }
+
+    pub fn get_token_balance(&mut self, address: &Address, token: &TokenTicker, db: &Storage) -> u64{
+        let account = self.get_account_mut(address, db);
+        *account.balance.get(token).unwrap_or(&0)
+    }
+
+    pub fn get_nonce(&mut self, addr: &Address, db: &Storage) -> u64{
+        let account = self.get_account_mut(addr, db);
+        account.nonce
+    }
+
+    pub fn check_nocne(&mut self, addr: &Address, tx_nonce: u64, db: &Storage) -> bool{
+        let account = self.get_account_mut(addr, db);
+        account.nonce == tx_nonce
+    }
+
+    pub fn inc_nonce(&mut self, addr: &Address, db: &Storage) {
+        let account = self.get_account_mut(addr, db);
+        account.nonce += 1;
+    }
+
+    pub fn add_balance(&mut self, addr: &Address, token: &TokenTicker, amount: u64, db: &Storage) {
+        let account = self.get_account_mut(addr, db);
+        let balance = account.balance.entry(token.clone()).or_insert(0);
+        *balance = balance.saturating_add(amount);
+    }
+    pub fn sub_balance(&mut self, addr: &Address, token: &TokenTicker, amount: u64, db: &Storage) -> Result<(), String>{
+        let account = self.get_account_mut(addr, db);
+        let balance = account.balance.entry(token.clone()).or_insert(0);
+        if *balance < amount {return Err("INSUFFICIENT BALANCE".into());}
+        *balance = balance.saturating_sub(amount);
+        Ok(())
+    }
+    
+    pub fn pay_gas(&mut self, addr: &Address, fee: u64, db: &Storage) -> Result<(), String>{
+        let account = self.get_account_mut(addr, db);
+        let balance = account.balance.entry("KRW".into()).or_insert(0);
+        if *balance < fee {return Err("INSUFFICIENT GAS FEE".into());}
+        self.sub_balance(addr, &"KRW".into(), fee, db)?;
+        self.gas_pool = self.gas_pool.saturating_add(fee);
+        Ok(())
+    }
+
+    pub fn distribute_gas(&mut self, db: &Storage){
+        if self.gas_pool == 0{return;}
+        let total_gas = self.gas_pool;
+        self.gas_pool = 0;
+        let shares: Vec<(Address, u64)> = self.gov_shares
+            .iter()
+            .map(|(addr, share)| (*addr, *share))
+            .collect();
+        let total_shares: u64 = self.gov_shares
+            .iter()
+            .map(|(_, share)| *share)
+            .sum();
+        println!("[TOTAL GAS]: {total_gas}KRW");
+        for (addr, share) in shares{
+            let reward = match total_shares{
+                0 => 0,
+                _ => (total_gas * share) / total_shares,
+            };
+            if reward > 0{
+                self.add_balance(&addr, &"KRW".to_string(), reward, db);
+            }
+        }
+    }
 }
 
 ==> ./src/block/mod.rs <==
-pub mod model_struct;
-pub mod struct_handler;
-pub mod state;
-pub mod state_handler;
+pub mod types;
+pub mod block;
 pub mod transaction;
+pub mod balance;
 pub mod db;
 pub mod block_tester;
-==> ./src/block/state.rs <==
-use std::{collections::HashMap, sync::Arc};
-use serde::{Deserialize, Serialize};
+pub mod genesis;
+pub mod asset;
+==> ./src/block/genesis.rs <==
+use std::collections::HashMap;
 
-use crate::block::{db::{self, Storage}, model_struct::BlockData};
+use once_cell::sync::Lazy;
 
+use crate::block::types::{BlockData, BlockHeader, TokenInfo};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Account{
-    pub balance: u64,
-    pub nonce: u64,
-}
+pub const DECIMALS: u64 = 1_000_000_000;
+pub const TOTAL_SUPPLY: u64 = 100 * DECIMALS;
 
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalBalance{
-    pub balances: HashMap<[u8; 20], Account>,
-    pub gov_shares: HashMap<[u8; 20], u64>,
-    pub gas_pool: u64,
-}
-
-impl GlobalBalance{
-    pub fn new() -> Self{
-        let mut gov_shares = HashMap::new();
-        gov_shares.insert([0x11; 20], 60);
-        gov_shares.insert([0x22; 20], 40);
-        Self{
-            balances: HashMap::new(),
-            gov_shares,
-            gas_pool: 0,
-        }
-    }
-    /**
-     * This check current block(Not confirmed) first
-     * 
-     */
-    pub fn get_account(&mut self, address: &[u8; 20], db: Arc<Storage>) -> Account{
-        
-        if let Some(acc) = self.balances.get(address) {
-            return acc.clone();
-        }
-        if db.is_exist(address){
-            if let Some(acc) = db.get_account(address){
-                self.balances.insert(*address, acc.clone());
-                return acc;
-            }
-        }
-        Account{
-            balance: 0,
-            nonce: 0
-        }
-    }
-
-    pub fn get_balance(&mut self, address: &[u8; 20], db: Arc<Storage>) -> u64{
-        self.get_account(address, db).balance
-    }
-    pub fn get_nonce(&mut self, address: &[u8; 20], db: Arc<Storage>) -> u64{
-        self.get_account(address, db).nonce
-    }
-
-    pub(crate) fn set_balance(&mut self, address: [u8; 20], amount: u64, db: &Storage){
-        ///여기도 없으면 DB에서 가져오는 로직이 핑료함.
-        let account = self.balances.entry(address).or_insert_with(||{
-            db.get_account(&address).unwrap_or(Account { balance: 0, nonce: 0 })
-        });
-        account.balance = amount;
-    }
-
-    pub fn increase_nonce_only(&mut self, address: [u8; 20], db: Arc<Storage>){
-        let account = self.balances.entry(address).or_insert_with(||{
-            db.get_account(&address).unwrap_or(Account{balance:0, nonce:0})
-        });
-        account.nonce = account.nonce.saturating_add(1);
-    }
-
-    pub fn increase_nonce_change_balance(&mut self, address: [u8; 20], new_balance: u64, db: &Storage){
-        let account = self.balances.entry(address).or_insert_with(||{
-            db.get_account(&address).unwrap_or(Account { balance: 0, nonce: 0 })
-        });
-        account.balance = new_balance;
-        account.nonce = account.nonce.saturating_add(1);
-        
-    }
-
-
-
-    pub(crate) fn add_gas(&mut self, fee: u64){
-        self.gas_pool = self.gas_pool.saturating_add(fee);
-    }
-    pub(crate) fn drain_gas_pool(&mut self) -> u64{
-        let amount = self.gas_pool;
-        self.gas_pool = 0;
-        amount
-    }
-
-    pub fn commit_to_db(&mut self, db: &Storage, block: &BlockData){
-        db.commit_block(block, &self.balances);
-        self.balances.clear();
-        if self.gas_pool > 0{println!("[WARN] Gas pool is not empty during comit");}
-    }
-}
-==> ./src/block/state_handler.rs <==
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
-
-use crate::block::{db::Storage, state::GlobalBalance};
-
-#[derive(Clone)]
-pub struct BalanceReader{
-    inner: Arc<RwLock<GlobalBalance>>,
-    storage: Arc<Storage>
-}
-#[derive(Clone)]
-pub struct BalanceWriter{
-    inner: Arc<RwLock<GlobalBalance>>,
-    storage: Arc<Storage>
-}
-
-//balanceReader
-impl BalanceReader{
-    pub fn new(inner: Arc<RwLock<GlobalBalance>>, storage: Arc<Storage>) -> Self{
-        Self{inner, storage}
-    }
-    pub async fn get_balance(&self, address: [u8; 20]) -> u64{
-        let mut state = self.inner.write().await;
-        state.get_balance(&address, self.storage.clone())
-    }
-    pub async fn get_pending_gas(&self) -> u64{
-        let state = self.inner.read().await;
-        state.gas_pool
-    }
-}
-
-impl BalanceWriter{
-    pub fn new(inner: Arc<RwLock<GlobalBalance>>, storage: Arc<Storage>) -> Self{
-        Self{inner, storage}
-    }
-
-    pub async fn exc_committed_transaction(&self, from:[u8;20], to:[u8;20], amount:u64, fee:u64) -> bool{
-        let mut state = self.inner.write().await;
-
-        let sender_balance = state.get_balance(&from, self.storage.clone());
-        if (sender_balance < amount) && (fee < amount) {return false;}
-        state.set_balance(from, sender_balance-amount, &self.storage);
-
-        let net_amount = amount.saturating_sub(fee);
-        let receiver_cur = state.get_balance(&to, self.storage.clone());
-        state.set_balance(to, receiver_cur + net_amount, &self.storage);
-        state.add_gas(fee);
-        true
-    }
-
-    pub async fn distribute_gas(&self){
-        let mut state = self.inner.write().await;
-        let total_gas = state.drain_gas_pool();
-        if total_gas == 0 {return;}
-        let shares: Vec<([u8;20], u64)> = state.gov_shares.iter()
-            .map(|(addr, share)| (*addr, *share))
-            .collect();
-        for (addr, share) in shares{
-            let reward = (total_gas * share)/100;
-            let current = state.get_balance(&addr, self.storage.clone());
-            state.set_balance(addr,current+reward, &self.storage);
-        }
-        ("[GAS]:가스비 분배 완료");
-    }
-
-}
-==> ./src/block/struct_handler.rs <==
-
-
+==> ./src/block/block.rs <==
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::block::{model_struct::*, transaction::TransactionData};
+use crate::block::{transaction::{ConfirmedTransaction, TransactionData}, types::*};
 use sha3::{Keccak256, Digest};
 
 
 impl BlockData{
     pub fn new(
         prev_block: &BlockData,
-        transactions: Vec<TransactionData>,
+        transactions: Vec<ConfirmedTransaction>,
         valdiator: Address
     ) -> Self{
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let merkle_root = [0u8; 32];
+        let merkle_root = Self::calculate_merkle_root(transactions.clone());
         let header = BlockHeader{
             height: prev_block.header.height + 1,
             prev_block_hash: prev_block.hash,
@@ -1423,6 +1897,31 @@ impl BlockData{
             hash: block_hash,
             signature: dummy_signature,
         }
+    }
+
+    pub fn calculate_merkle_root(transactions: Vec<ConfirmedTransaction>) -> [u8;32]{
+        if transactions.is_empty(){return [0u8;32];}
+        let mut hashes: Vec<[u8;32]> = transactions
+            .iter()
+            .map(|tx| tx.hash)
+            .collect();
+        while hashes.len() > 1{
+            if hashes.len() % 2 != 0{
+                hashes.push(*hashes.last().unwrap());
+            }
+            let mut next_level = Vec::new();
+            for chunk in hashes.chunks(2){
+                let mut hasher = Keccak256::new();
+                hasher.update(&chunk[0]);
+                hasher.update(&chunk[1]);
+                let result = hasher.finalize();
+                let mut node_hash = [0u8;32];
+                node_hash.copy_from_slice(&result);
+                next_level.push(node_hash);
+            }
+            hashes = next_level;
+        }
+        hashes[0]
     }
 
     pub fn create_genesis_block(valdiator:Address) -> Self{

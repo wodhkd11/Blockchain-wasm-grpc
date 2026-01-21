@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use sha3::{Digest, Keccak256};
-use crate::{block::model_struct::{Address, Hash}, crypto::signature};
+use crate::{block::types::{Address, Hash}, crypto::signature};
 
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -62,13 +62,7 @@ impl TransactionData{
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfirmedTransaction{
-    pub sender: Address,
-    pub receiver: Address,
-    pub value: u64,
-    pub nonce: u64, // 이중지불 방지용 트랜잭션 순서
-    pub payload: Vec<u8>,
-    #[serde_as(as = "[_; 65]")]
-    pub signature: [u8; 65],
+    pub tx_info: TransactionData,
     pub hash: Hash,
 }
 
@@ -80,13 +74,34 @@ impl ConfirmedTransaction{
     pub fn from(tx: &TransactionData) -> Self{
         let tx_hash = tx.calculate_hash();
         Self{
-            sender: tx.sender,
-            receiver: tx.receiver,
-            value: tx.value,
-            payload: tx.payload.clone(),
-            nonce: tx.nonce,
-            signature: tx.signature,
+            tx_info: tx.clone(),
             hash: tx_hash,
+        }
+    }
+
+}
+
+pub struct TransactionForDB{
+    pub tx_info: TransactionData,
+    pub hash: Hash,
+    pub block_height: u64,
+    pub block_hash: Hash,
+    pub index: u64,
+}
+
+impl TransactionForDB{
+    /**
+     * This function gets TransactionData 
+     * and returns ConfirmedTransaction
+     */
+    pub fn from(tx: &TransactionData, block_height: u64, block_hash: Hash, idx: u64) -> Self{
+        let tx_hash = tx.calculate_hash();
+        Self{
+            tx_info: tx.clone(),
+            hash: tx_hash,
+            block_height,
+            block_hash,
+            index: idx,
         }
     }
 

@@ -1,6 +1,7 @@
 
 
 
+use once_cell::sync::Lazy;
 use tokio::net::{TcpListener};
 use tokio::sync::RwLock;
 use std::sync::Arc;
@@ -9,18 +10,23 @@ use std::net::{SocketAddr};
 use std::time::{Instant};
 //use crate::block::block_tester::run_block_tester;
 use crate::block::db::Storage;
-use crate::block::model_struct::{Hash};
-use crate::block::state::GlobalBalance;
+use crate::block::genesis::{DECIMALS, TOTAL_SUPPLY};
+//use crate::block::genesis::GENESIS_BLOCK;
+use crate::block::types::{Address, BlockData, GlobalBalance, Hash, TokenInfo};
 use crate::block::transaction::TransactionData;
-use crate::network::{discovery, rpc};
+use crate::network::rpc;
 use crate::network::peer::{Peer};
+use crate::network::tasks::discovery;
 
 //현재 노드가 어떤 상태인지를 담고 있다.
 // 현재 개방중인 포트, 내 IP주소, 나와 연결된 노드들의 정보를 담고 있다.
+pub static GENESIS_BLOCK: Lazy<BlockData> = Lazy::new(|| {
+    BlockData::create_genesis_block([0u8;20])
+});
 pub struct Node{ 
     pub port:u16,
     pub addr: SocketAddr,
-    pub wallet: [u8; 20],
+    pub wallet: Address,
     pub chain_id: u64,
     pub peers: HashMap<SocketAddr, Peer>,
     pub unconnected_addrs: HashSet<SocketAddr>,
@@ -29,6 +35,9 @@ pub struct Node{
     pub mempool: HashMap<Hash, TransactionData>, // 다음 블록이 생기기 이전까지 트랜잭션 저장 캐시 역할을 맡음. 
     pub global_state: GlobalBalance, //블록 생기기 전까지 잔액을 관리함
     pub storage: Arc<Storage>,
+
+    pub last_block: BlockData,
+    pub block_height: u64,
 }
 
 #[derive(Clone)]
@@ -38,8 +47,50 @@ pub struct NodeManage{
 impl NodeManage{
 
 
-    pub fn new(port:u16, addr: &str, wallet: [u8;20], path: &str) -> Self{
+    pub fn new(port:u16, addr: &str, wallet: [u8;20], path: &str, is_genesis: bool) -> Self{
+
         let node_addr = addr.parse().expect("INVALID ADDR");
+        let storage = Arc::new(Storage::new(path));
+        let last_block = if storage.is_empty(){
+            if is_genesis {
+                println!("I am genesis NODE");
+                let g = BlockData::create_genesis_block(wallet);
+                g
+            }else{
+                println!("[NODE]: Load Genesis setting");
+                GENESIS_BLOCK.clone()
+            }
+        } else{ storage.get_latest_block().unwrap() };
+        let block_height = last_block.header.height;
+        let mut global_state = GlobalBalance::new();
+        let owner = hex::decode("0fa41b6927a59eccb1f253a62e0164b5ce96f7c5")
+            .expect("");
+        let mut owner_addr = [0u8;20];
+        owner_addr.copy_from_slice(&owner);
+            
+        global_state.token_metadata.insert("KRW".to_string(), TokenInfo {
+            name: "Korean Won".to_string(),
+            symbol: "KRW".to_string(),
+            decimals: 1,
+            total_supply: TOTAL_SUPPLY, // 소수점 포함 계산
+            admin: owner_addr,
+        });
+
+        // 2. GOV 토큰 메타데이터 등록
+        global_state.token_metadata.insert("GOV".to_string(), TokenInfo {
+            name: "Governance Token".to_string(),
+            symbol: "GOV".to_string(),
+            decimals: 1,
+            total_supply: TOTAL_SUPPLY,
+            admin: owner_addr,
+        });
+
+        global_state.add_balance(&owner_addr, &"GOV".to_string(), TOTAL_SUPPLY, &storage);
+        global_state.add_balance(&owner_addr, &"KRW".to_string(), 100000*DECIMALS, &storage);
+        
+        let genesis = &*GENESIS_BLOCK;
+
+        println!("{:?}",genesis.hash) ;              
         Self { 
             state: Arc::new(RwLock::new(Node{
                 port,
@@ -51,8 +102,10 @@ impl NodeManage{
                 max_peers: 100, // Default: 10, need to change
                 recent_seen_message: HashMap::new(),
                 mempool: HashMap::new(),
-                global_state: GlobalBalance::new(),
-                storage: Arc::new(Storage::new(path)),
+                global_state: global_state,
+                storage,
+                last_block: genesis.clone(),
+                block_height: 0,
             })),
          }
     }
@@ -72,9 +125,9 @@ impl NodeManage{
 
         let rc = Arc::clone(&manager);
         tokio::spawn(async move{rc.start_reconnector().await;});
-
+        
         let mn = Arc::clone(&manager);
-        tokio::spawn(async move{mn.start_miner().await;});
+        tokio::spawn(async move {mn.start_miner().await;});
         //let tester = Arc::clone(&self);
         //tokio::spawn(async move{run_block_tester(tester).await;});
 

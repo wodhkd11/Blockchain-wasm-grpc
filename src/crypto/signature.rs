@@ -1,8 +1,27 @@
-use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use k256::{ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey, signature::hazmat::PrehashSigner}};
 use sha3::{Keccak256, Digest};
 
-use crate::block::model_struct::Address;
+use crate::{PRIVATE_KEY, block::types::Address};
 
+//pub fn sign(block_hash: &Hash) -> Result<Vec<u8>, String>{
+    //let signing_key = SigningKey::from_bytes(private_key_bytes.into()).expect("INVALID PRIVATE KEY");
+
+//}
+
+
+pub fn sign(hash: &[u8;32] ) -> Result<[u8;65], String>{
+    let priv_bytes = PRIVATE_KEY.get().expect("");
+    let signing_key = SigningKey::from_bytes(priv_bytes.into()).expect("");
+
+    let (signature, recoveryid) = signing_key
+        .sign_prehash(hash)
+        .expect("");
+    let mut sig_bytes = [0u8;65];
+    sig_bytes[..64].copy_from_slice(&signature.to_bytes());
+    sig_bytes[64] = recoveryid.to_byte() + 27;
+    Ok(sig_bytes)
+
+}
 
 pub fn verify(
     sender: Address,
@@ -37,6 +56,29 @@ pub fn verify(
     let recovered_address = public_key_to_address(&recovered_key);
     recovered_address == sender
 
+}
+
+pub fn verify_for_block(
+    validator: Address,
+    signature_bytes: &[u8; 65],
+    block_hash: &[u8;32],
+) -> bool{
+    let sig = match Signature::from_slice(&signature_bytes[..64]){
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let v = signature_bytes[64];
+    let rec_id_byte = if v >= 27 { v - 27 } else {v};
+    let recoveryid = match RecoveryId::from_byte(rec_id_byte){
+        Some(id) => id,
+        None => return false,
+    };
+    let recovered_key = match VerifyingKey::recover_from_prehash(block_hash, &sig, recoveryid){
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+    let recovered_addr = public_key_to_address(&recovered_key);
+    recovered_addr == validator
 }
 
 

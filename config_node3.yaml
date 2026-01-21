@@ -1,0 +1,16 @@
+
+node:
+  ip_address: "127.0.0.1:9003"
+  port: 9002
+  rpc_port: 10003
+  wallet_address: "0xecb3b6904f4ad0cba7d0a8ba453d9204108f3294"
+  node_type: "full_node" #validator, full_node, light_node
+  is_genesis: false
+
+network:
+  boot_nodes: 
+    - "127.0.0.1:9000"
+
+
+storage:
+  db_path: "./data/node_9002"

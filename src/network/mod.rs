@@ -1,9 +1,8 @@
 pub mod node;
 pub mod message;
 pub mod peer;
-pub mod discovery;
-pub mod handler;
-pub mod tasks;
+pub mod connection;
 pub mod gossip;
-pub mod server;
+pub mod tasks;
 pub mod rpc;
+pub mod init;

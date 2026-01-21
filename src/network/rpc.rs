@@ -6,7 +6,7 @@ use serde_with::serde_as;
 use sha3::{Digest, Keccak256};
 use tower_http::cors::{Any, CorsLayer};
 use std::sync::Arc;
-use crate::{block::{model_struct::Hash, transaction::TransactionData}, network::{message::NetworkMessage, node::NodeManage}};
+use crate::{block::{types::Hash, transaction::TransactionData}, network::{message::NetworkMessage, node::NodeManage}};
 use hex;
 
 #[derive(Deserialize)]
@@ -74,25 +74,25 @@ async fn handle_tx_submission(
     let mut hasher = Keccak256::new();
     hasher.update(&payload.signature);
     let sig_hash: [u8; 32] = hasher.finalize().into();
-
     let tx = payload.to_core_data().ok_or(StatusCode::UNAUTHORIZED)?;
-
+    let tx_id = tx.calculate_hash();
     let sender_address = tx.sender;
+
     {
         let mut state = manager.state.write().await;
         let storage = state.storage.clone();
         let storage_clone = storage.clone();
-        let cur_nonce = state.global_state.get_nonce(&sender_address, storage);
-        if tx.nonce!= cur_nonce{
-            println!("[RPC]: Nonce mismatch");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        if state.mempool.contains_key(&sig_hash){
-            return Err(StatusCode::CONFLICT);
-        }
-        state.mempool.insert(sig_hash, tx.clone());
-
-        state.global_state.increase_nonce_only(tx.sender, storage_clone);
+        let _ = match state.global_state.check_nocne(&sender_address, tx.nonce, &storage_clone){
+            true => {
+                if state.mempool.contains_key(&sig_hash){ return Err(StatusCode::CONFLICT); }
+                state.mempool.insert(tx_id, tx.clone());               
+            },
+            false => {
+                println!("[RPC]: Nonce mismatch");
+                return Err(StatusCode::BAD_REQUEST);
+            },
+        };
+        //Commit 시 해야됨 state.global_state.increase_nonce_only(tx.sender, storage_clone);
         
     }
     let msg = NetworkMessage::NewTransaction(tx.clone());
@@ -108,8 +108,9 @@ async fn get_nonce_handler(
     Path(address): Path<String>,
 ) -> impl IntoResponse{
     let address = hex_to_address(&address);
-    let mut manager_clone = manager.state.read().await;
-    let nonce = manager_clone.global_state.get_nonce_readonly(&address);
+    let mut manager_clone = manager.state.write().await;
+    let storage = manager_clone.storage.clone();
+    let nonce = manager_clone.global_state.get_nonce(&address, &storage);
     Json(nonce)
 }
 

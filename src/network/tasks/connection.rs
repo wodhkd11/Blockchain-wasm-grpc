@@ -23,7 +23,7 @@ impl NodeManage{
             
             // 접속 시도 대상 추출
             let targets: Vec<SocketAddr> = {
-                let state = self.state.read().await;
+                let state: tokio::sync::RwLockReadGuard<'_, crate::network::node::Node> = self.state.read().await;
                 state.unconnected_addrs.iter().cloned().collect()
             };
 

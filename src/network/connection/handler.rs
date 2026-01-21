@@ -4,6 +4,9 @@ use std::time::Instant;
 
 use sha3::{Digest, Keccak256};
 
+use crate::block::types::BlockData;
+use crate::crypto::signature::{verify, verify_for_block};
+use crate::exec;
 use crate::network::node::NodeManage;
 use crate::network::message::NetworkMessage;
 
@@ -28,7 +31,39 @@ impl NodeManage{
         if needs_gossip{ println!("Received Message: {:?} from {}", msg, from_addr); }
         match msg{
             NetworkMessage::NewBlock(block) =>{
-                
+                //check block is already exists
+                { 
+                    let state = self.state.read().await;
+                    if state.storage.get_block(&block.hash).is_some() { return; }
+                }
+                //check block is valid
+                let calculated_hash = BlockData::calculate_header_hash(&block.header);
+                if calculated_hash != block.hash{
+                    println!("[WARN]: Hash missmatched");
+                    return;
+                }
+                //check signature is valid
+                let sig: [u8;65] = block.signature.clone();
+                if !verify_for_block(block.header.valdiator, &sig, &block.hash){
+                    println!("[WARN]: Block Signature invalid");
+                    return;
+                }
+                let mut node_state = self.state.write().await;
+                let mut temp_state = node_state.global_state.clone();
+
+                match exec::execute_block(&mut temp_state, &block, &node_state.storage){
+                    Ok(state_updates) =>{
+                        node_state.global_state = temp_state;
+                        node_state.storage.commit_block(&block, &state_updates, &node_state.global_state);
+                        node_state.last_block = block.clone();
+                        node_state.block_height = block.header.height;
+                        node_state.global_state.balances.clear();
+                        println!("[SUCCESS]: Blcok #{} accepted.", block.header.height);
+                    }
+                    Err(e) => {
+                        println!("[REJECT] Block #{} rejected: {}", block.header.height, e);
+                    }
+                }
             }
             NetworkMessage::NewTransaction(tx) => {
                 let sig_hash:[u8;32] = {

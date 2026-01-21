@@ -1,0 +1,16 @@
+
+node:
+  ip_address: "127.0.0.1:9001"
+  port: 9001
+  rpc_port: 10001
+  wallet_address: "0xbde55af09fa96f5230330b72d06e5f826c34e16d"
+  private: "0x5984a8da78ac4e937599eb019cef32c1885ddac1ccc471dd1245027db8f0e446"
+  node_type: "full_node" #validator, full_node, light_node
+  is_genesis: false
+
+network:
+  boot_nodes: 
+    - "127.0.0.1:9000"
+
+storage:
+  db_path: "./data/node_9001"
