@@ -39,6 +39,7 @@ pub fn handle_mint(
         from_acc.pay_gas(fee, &gas_tkn);
         from_acc.inc_nonce();
     }
+    state.add_to_gas_pool(fee);
     {
         let to_acc = state.get_account_safe(&to, cur_height, db);
         to_acc.add_balance(&token, value - fee);
@@ -49,5 +50,6 @@ pub fn handle_mint(
     Ok(StateDiff{
         accounts: changed_accounts,
         token_changed: Some(token),
+        config_changed: false,
     })
 }

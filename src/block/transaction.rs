@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
+use serde_with::{serde_as, Bytes};
 use sha3::{Digest, Keccak256};
 use crate::{block::types::{Address, Balance, Hash}, crypto::signature};
 
@@ -11,12 +11,12 @@ pub struct TransactionData{
     pub value: Balance,
     pub nonce: u64, // 이중지불 방지용 트랜잭션 순서
     pub payload: Vec<u8>,
-    #[serde_as(as = "[_; 65]")]
-    pub signature: [u8; 65],
+    #[serde_as(as = "Vec<Bytes>")]
+    pub signature: Vec<[u8; 65]>,
 }
 
 impl TransactionData{
-    pub fn new(sender: [u8;20], receiver: [u8; 20], value: Balance, payload: Vec<u8>, nonce: u64, signature:[u8; 65] ) -> Self{
+    pub fn new(sender: [u8;20], receiver: [u8; 20], value: Balance, payload: Vec<u8>, nonce: u64, signature: Vec<[u8; 65]> ) -> Self{
         let tx = Self{
             sender,
             receiver,
@@ -35,7 +35,7 @@ impl TransactionData{
         hasher.update(&self.value.to_big_endian());
         hasher.update(&self.nonce.to_be_bytes());
         hasher.update(&self.payload);
-        hasher.update(&self.signature);
+        //hasher.update(&self.signature);
 
         let result = hasher.finalize();
         let mut hash_res = [0u8; 32];
@@ -56,7 +56,13 @@ impl TransactionData{
     pub fn verify(&self) -> bool{
         let message = self.generate_payload_to_bytes();
         println!("{:?}", message);
-        signature::verify(self.sender, &self.signature, &message)
+
+        for sig in &self.signature{
+            if !signature::verify(self.sender, sig, &message){
+                return false;
+            }
+        }
+        true
     }
 }
 

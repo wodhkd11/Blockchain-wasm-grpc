@@ -33,15 +33,15 @@ impl NodeManage{
         match msg{
             NetworkMessage::NewBlock(block) => self.handle_new_block(block).await,
             NetworkMessage::NewTransaction(tx) => {
-                let sig_hash:[u8;32] = {
-                    let mut hasher = Keccak256::new();
-                    hasher.update(&tx.signature);
-                    hasher.finalize().into()
-                };
+                let tx_id = tx.calculate_hash();
                 let mut state = self.state.write().await;
-                if !state.mempool.contains_key(&sig_hash){
-                    state.mempool.insert(sig_hash, tx.clone());
-                    println!("[New transaction Added], Total: {}",state.mempool.len());
+                if !state.mempool.contains_key(&tx_id){
+                    if tx.verify(){
+                        state.mempool.insert(tx_id, tx.clone());
+                        println!("[NEW TRANSACTION]: ID: {:?}", tx_id);
+                    } else { 
+                        println!("[TRANSACTION REJECTED]: Invalid transaction signature");
+                    }
                 }
             }
             NetworkMessage::Hello { listening_port } => {

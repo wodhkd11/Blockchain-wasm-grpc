@@ -27,8 +27,8 @@ pub struct TransactionRequest{
     pub value: Balance,
     pub nonce: u64,
     pub payload: Vec<u8>,
-    #[serde_as(as = "serde_with::hex::Hex")]
-    pub signature: [u8; 65],
+    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    pub signature: Vec<[u8; 65]>,
 } // after get string, to_hex and do Transaction::New()
 
 pub async fn start_rpc_server(manager: Arc<NodeManage>, rpc_port: u16){
@@ -195,10 +195,6 @@ async fn handle_tx_submission(
     let tx = payload.to_core_data().ok_or(StatusCode::UNAUTHORIZED)?;
     let tx_id = tx.calculate_hash();
     
-    let mut hasher = Keccak256::new();
-    hasher.update(&payload.signature);
-    let sig_hash: [u8; 32] = hasher.finalize().into();
-
     {
         let mut node_state = manager.state.write().await;
         let storage = &node_state.storage;
@@ -214,7 +210,7 @@ async fn handle_tx_submission(
     let manager_clone = manager.clone();
     let msg = NetworkMessage::NewTransaction(tx.clone());
     tokio::spawn(async move{manager_clone.broadcast(msg).await;});
-    Ok(Json(sig_hash))
+    Ok(Json(tx_id))
 }
 
 async fn get_nonce_handler(
@@ -268,7 +264,7 @@ impl TransactionRequest{
             self.value,
             self.payload.clone(),
             self.nonce,
-            self.signature,
+            self.signature.clone(),
         ))
     }
     fn verify_signature(&self) -> bool{
@@ -279,10 +275,13 @@ impl TransactionRequest{
         v.extend_from_slice(&value_bytes);
         v.extend_from_slice(&self.nonce.to_be_bytes());
         v.extend_from_slice(&self.payload);
-        println!("[DEBUG] Backend Message Bytes: 0x{}", hex::encode(&v));
-        println!("[DEBUG] Sender: 0x{}", hex::encode(&self.sender));
-        println!("[DEBUG] Signature: 0x{}", hex::encode(&self.signature));
-        crate::crypto::signature::verify(self.sender, &self.signature, &v)
+        // println!("[DEBUG] Backend Message Bytes: 0x{}", hex::encode(&v));
+        // println!("[DEBUG] Sender: 0x{}", hex::encode(&self.sender));
+        // println!("[DEBUG] Signature: 0x{}", hex::encode(&self.signature));
+        for sig in &self.signature{
+            if !crate::crypto::signature::verify(self.sender, sig, &v){ return false; }
+        }
+        true
     }
 }
 

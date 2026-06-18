@@ -1,3 +1,4 @@
+use rlp::{Encodable, Decodable, RlpStream, Rlp};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
@@ -6,14 +7,38 @@ use crate::{block::types::{Address, Balance, TokenTicker}, rule::config::Network
 
 //Payload Structure
 #[serde_as]
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct RawPayload{
     pub opcode: u8,
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub fee: Option<Balance>,
-    pub data: serde_json::Value,
+    pub data: Vec<u8>,
 }
 
+impl Encodable for RawPayload{
+    fn rlp_append(&self, s: &mut RlpStream){
+        s.begin_list(3);
+        s.append(&self.opcode);
+        match &self.fee{
+            Some(f) => s.append(f),
+            None => s.append(&vec![0u8; 0]),
+        };
+        s.append(&self.data);
+    }
+}
+impl Decodable for RawPayload{
+    fn decode(rlp: &Rlp) -> Result<Self, rlp::DecoderError> {
+        Ok(RawPayload{
+            opcode: rlp.val_at(0)?,
+            fee: {
+                let raw_fee: Vec<u8> = rlp.val_at(1)?;
+                if raw_fee.is_empty() { None }
+                else { Some(rlp.val_at(1)?) }
+            },
+            data: rlp.val_at(2)?,
+        })
+    }
+}
 
 //0x00: Token Register
 #[derive(Deserialize, Serialize)]

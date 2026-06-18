@@ -4,7 +4,7 @@ use eth_trie::{EthTrie, Trie};
 use primitive_types::{H256, U256};
 use alloy_primitives::B256;
 
-use crate::{block::{db::{Storage, TrieDb}, types::{Account, AccountState, Address, Hash, PrimaryAsset, StateDiff}}, rule::config::NetworkConfig};
+use crate::{block::{db::{Storage, TrieDb}, types::{Account, AccountState, Address, GlobalBalance, Hash, PrimaryAsset, StateDiff}}, rule::config::NetworkConfig};
 
 #[derive(Debug)]
 pub enum StateError{
@@ -45,7 +45,9 @@ impl StateManager{
 
     }
 
-    pub fn apply_diff(&mut self, diff: StateDiff, config: &NetworkConfig) -> Result<H256, StateError>{
+    pub fn apply_diff(&mut self, diff: StateDiff,
+        global_state: &mut GlobalBalance
+    ) -> Result<H256, StateError>{
         for (address, account) in diff.accounts{
             let existing_data = self.trie.get(&address)
                 .map_err(|e| StateError::TrieError(format!("{:?}", e)))?;
@@ -57,15 +59,28 @@ impl StateManager{
                     nonce: 0,
                     primary_assets: Vec::new(),
                     asset_root: H256::zero(),
+                    is_frozen: false,
                 }
             };
 
             mpt_account.nonce = account.nonce;
 
+            global_state.balances.insert(address, account.clone());
+
+            if let Some(gov_balance) = account.balance.get(&global_state.config.gov_token) {
+                println!("[D4], Addr: {:?} Gov balance changed to {}", address, gov_balance);
+                if gov_balance.is_zero(){
+                    global_state.gov_shares.remove(&address);
+                } else {
+                    global_state.gov_shares.insert(address, *gov_balance);
+                }
+            }
+
+
             let mut sub_trie_opt = None;
 
             for (ticker, amount) in account.balance{
-                if ticker == config.gas_token || ticker == config.gov_token {
+                if ticker == global_state.config.gas_token || ticker == global_state.config.gov_token {
                     if let Some(pos) = mpt_account.primary_assets.iter().position(|a| a.ticker == ticker) {
                         mpt_account.primary_assets[pos].amount = amount;
                     } else { 
@@ -129,6 +144,7 @@ impl StateManager{
                 nonce: state.nonce,
                 last_seen_block: cur_height,
                 asset_root: state.asset_root,
+                is_frozen: state.is_frozen,
             })
 
         } else {
@@ -137,6 +153,7 @@ impl StateManager{
                 nonce: 0,
                 last_seen_block: cur_height,
                 asset_root: H256::zero(),
+                is_frozen: false,
             })
         }
     }
@@ -160,6 +177,7 @@ impl StateManager{
                         nonce: state.nonce,
                         last_seen_block: 0,
                         asset_root: state.asset_root,
+                        is_frozen: state.is_frozen,
                     });
                 }
             }

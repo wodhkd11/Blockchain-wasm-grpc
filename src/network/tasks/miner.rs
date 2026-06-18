@@ -27,6 +27,7 @@ impl NodeManage{
             let mut global_state = node_lock.global_state.write().await.clone();
             let mut state_update: HashMap<Address, Account> = HashMap::new();
             let mut token_updates = HashSet::new();
+            let mut config_changed: bool = false;
             let mut valid_transactions = Vec::new();
 
 
@@ -52,7 +53,10 @@ impl NodeManage{
 
                 match exec::apply_transaction(&mut global_state, &tx, next_height, &storage){
                     Ok(diff) => {
-                        println!("2");
+                        if diff.config_changed == true {
+                            config_changed = true;
+                        }
+                        println!("[D2]: {}", global_state.gas_pool);
                         node_lock.mempool.remove(&key);
                         valid_transactions.push(ConfirmedTransaction::from(&tx));
                         for (addr, acc) in diff.accounts{
@@ -74,22 +78,44 @@ impl NodeManage{
                 continue;
             }
 
-            let final_diff = StateDiff{
-                accounts: state_update.clone(),
-                token_changed: None
-            };
-
-            let mut sm_lock = state_manager.write().await;
-            let new_state_root = match sm_lock.apply_diff(final_diff, &global_state.config){
-                Ok(root) => root,
+            let rewarded_updates = match global_state.distribute_gas(next_height, &storage){
+                Ok(updates) => updates,
                 Err(e) => {
-                    println!("[MINER]: MPT ROOT GENERATE FAILED: {:?}", e);
+                    println!("[MINER]: Gas distribution failed: {:?}", e);
                     continue;
                 }
             };
+            
+            for (addr, acc) in rewarded_updates{
+                state_update.insert(addr, acc);
+            }
+
+            let final_diff = StateDiff{
+                accounts: state_update.clone(),
+                token_changed: None,
+                config_changed,
+            };
+
+            let mut sm_lock = state_manager.write().await;
+
+            let apply_result = sm_lock.apply_diff(final_diff, &mut global_state);
+            let new_state_root = match apply_result{
+                Ok(root) => root.into(),
+                Err(e) => {
+                    if config_changed{
+                        println!("[MINER]: MPT FAILED BUT CONFIG CHANGED, FORCING GENERATION");
+                        println!("[MINER]: original error: {:?}", e);
+                        node_lock.last_block.header.state_root
+                    } else {
+                        println!("[MINER]: MPT ROOT GENERATE FAILED: {:?}", e);
+                        continue;
+                    }
+                }
+            };
+
+            if config_changed { println!("[MINER]: Config Changed"); }
 
             println!("[MINER]: New block generating: {} Transactions", valid_transactions.len());
-            global_state.distribute_gas(next_height, &storage);
         
             let new_block = BlockData::new(
                 &node_lock.last_block,
@@ -98,13 +124,14 @@ impl NodeManage{
                 my_address
             );
 
-            global_state.remove_from_memory(next_height, 20); // 이거 블록 20개가 아니라 cnofig에서 가져오는거도 해봐야됨.
             if let Err(e) = node_lock.storage.commit_block(&new_block, &state_update, &token_updates, &global_state){
                 println!("[MINER]: DB commit failed: {:?}", e);
                 continue;
             }
-            
+            global_state.remove_from_memory(next_height, 20); // 이거 블록 20개가 아니라 cnofig에서 가져오는거도 해봐야됨.
             *node_lock.global_state.write().await = global_state;
+
+            
             let block_hash = new_block.hash;
             node_lock.block_height = next_height;
             node_lock.last_block = new_block.clone();
@@ -113,7 +140,7 @@ impl NodeManage{
             println!("\n====================");
             println!("[MINER]: New block generated");
             println!("Height: {}",next_height);
-            println!("State Root: {}",new_state_root);
+            println!("State Root: {:?}",new_state_root);
             println!("Hash: {:?}",hex::encode(block_hash));
             println!("\n====================\n");
             let msg = NetworkMessage::NewBlock(new_block);

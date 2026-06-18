@@ -29,11 +29,12 @@ pub fn handle_transfer(
     let from_acc = state.get_account_safe(&from, cur_height, db);
     let gas_balance = state.get_token_balance_safe(&from, &gas_token, cur_height, db)
         .map_err(|e| format!("{:?}", e))?;
-
+    let mut value = value;
     if token == &gas_token {
         if gas_balance < value.saturating_add(fee){
             return Err("INSUFFICIENT_KRW".into());
         }
+        value = value.saturating_sub(fee).clone();
     }else{
         if gas_balance < fee{
             return Err("INSUFFICIENT_GAS".into());
@@ -47,17 +48,20 @@ pub fn handle_transfer(
             return Err(format!("GAS FEE NEED {min_gas}"));
         }
     }
+    println!("[D1]fee: {}, gas_token: {}", fee, state.config.gas_token);
     let gas_tkn = state.config.gas_token.clone();
     
     {
         let from_acc = state.get_account_safe(&from, cur_height, db);
-        from_acc.pay_gas(fee, &gas_tkn);
-        from_acc.sub_balance(&token, value.saturating_sub(fee));
+        from_acc.pay_gas(fee, &gas_tkn).map_err(|e| format!("{:?}", e))?; 
+        from_acc.sub_balance(&token, value);
         from_acc.inc_nonce();
     }
+    state.add_to_gas_pool(fee);
+    println!("[D1-1] curpool: {}", state.gas_pool);
     {
         let to_acc = state.get_account_safe(&to, cur_height, db);
-        to_acc.add_balance(&token, value.saturating_sub(fee));
+        to_acc.add_balance(&token, value);
     }
 
     let mut changed_accounts = HashMap::new();
@@ -66,6 +70,7 @@ pub fn handle_transfer(
     Ok(StateDiff{
         accounts: changed_accounts,
         token_changed: None,
+        config_changed: false,
     })
     
 }

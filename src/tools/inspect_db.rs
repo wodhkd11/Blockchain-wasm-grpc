@@ -13,84 +13,65 @@ fn main() {
     let file = File::create(output_path).expect("파일 생성 실패");
     let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "\n{:=^60}", " BLOCKCHAIN STORAGE INSPECTOR (UPDATED) ").unwrap();
-    println!("분석 중... 결과는 '{}'에 저장됩니다.", output_path);
-
-    let mut count = 0;
+    writeln!(writer, "\n{:=^60}", " REAL-TIME BLOCKCHAIN STORAGE REPORT ").unwrap();
 
     for item in iter {
         let (key, value) = item.expect("Iterator error");
         if key.is_empty() { continue; }
 
-        let prefix = key[0];
-        count += 1;
+        // key[0]가 'v', 'b', 'a' 등 약속된 프리픽스인지 확인
+        let prefix = key[0] as char;
+        let body = &key[1..];
 
         match prefix {
-            // 1. 블록 데이터 (Prefix 'b')
-            b'b' => {
-                let hash = &key[1..];
-                writeln!(writer, "[BLOCK] Hash: 0x{}", hex_encode(hash)).unwrap();
-                writeln!(writer, "        Size: {} bytes", value.len()).unwrap();
+            // 1. 블록 데이터 (b + BlockHash)
+            'b' => {
+                writeln!(writer, "[BLOCK] Hash: 0x{}", hex_encode(body)).unwrap();
+                writeln!(writer, "        Data Size: {} bytes", value.len()).unwrap();
             }
 
-            // 2. 블록 인덱스 (Prefix 'i')
-            b'i' => {
-                let height = u64::from_be_bytes(key[1..9].try_into().unwrap_or([0;8]));
-                writeln!(writer, "[INDEX] Height: {} -> Block Hash: 0x{}", height, hex_encode(&value)).unwrap();
-            }
-
-            // 3. 계정 정보 (Prefix 'a')
-            b'a' => {
-                let addr = &key[1..];
-                writeln!(writer, "[ACCOUNT] Addr: 0x{}", hex_encode(addr)).unwrap();
-                writeln!(writer, "          Data(Postcard): {}", hex_encode(&value)).unwrap();
-            }
-
-            // 4. 토큰 메타데이터 (Prefix 't')
-            b't' => {
-                let ticker = String::from_utf8_lossy(&key[1..]);
-                writeln!(writer, "[TOKEN] Ticker: {}", ticker).unwrap();
-                writeln!(writer, "        Metadata(Hex): {}", hex_encode(&value)).unwrap();
-            }
-
-            // 5. 트랜잭션 포인터 (Prefix 'p') - 새로 추가된 부분!
-            b'p' => {
-                let tx_hash = &key[1..];
-                writeln!(writer, "[TX_POINTER] Hash: 0x{}", hex_encode(tx_hash)).unwrap();
-                // TransactionForDB 구조체가 postcard로 들어있으므로 크기 확인 가능
-                writeln!(writer, "             Receipt Size: {} bytes", value.len()).unwrap();
-            }
-
-            // 6. 글로벌 상태 (Prefix 'g')
-            b'g' => {
-                if key.len() == 1 {
-                    writeln!(writer, "[GLOBAL_STATE] Type: LATEST").unwrap();
-                } else {
-                    let height = u64::from_be_bytes(key[1..9].try_into().unwrap_or([0;8]));
-                    writeln!(writer, "[GLOBAL_STATE] Type: SNAPSHOT | Height: {}", height).unwrap();
+            // 2. 블록 인덱스 (i + Height)
+            'i' => {
+                if body.len() == 8 {
+                    let height = u64::from_be_bytes(body.try_into().unwrap());
+                    writeln!(writer, "[INDEX] Height: {} -> Block Hash: 0x{}", height, hex_encode(&value)).unwrap();
                 }
-                writeln!(writer, "               Size: {} bytes", value.len()).unwrap();
             }
 
-            // 7. 스테이커 정보 (Prefix 's') - 새로 추가된 부분!
-            b's' => {
-                let addr = &key[1..];
-                let amount = u64::from_be_bytes(value[..8].try_into().unwrap_or([0;8]));
-                writeln!(writer, "[STAKER] Addr: 0x{}", hex_encode(addr)).unwrap();
-                writeln!(writer, "         Amount: {} GOV", amount).unwrap();
+            // 3. 계정 정보 (a + Address) - 현재 깨져 보이는 부분 해결
+            'a' => {
+                writeln!(writer, "[ACCOUNT] Address: 0x{}", hex_encode(body)).unwrap();
+                // 프로젝트가 postcard를 사용한다면 여기서 역직렬화 시도 가능
+                writeln!(writer, "          Encoded State: {}", hex_encode(&value)).unwrap();
             }
 
-            // 8. 특수 키 (last_block, latest_snapshot_height 등)
+            // 4. MPT 노드 (v + NodeHash) - 리포트에서 [UNKNOWN]으로 떴던 것들
+            'v' => {
+                writeln!(writer, "[MPT_NODE] Node Hash: 0x{}", hex_encode(body)).unwrap();
+                writeln!(writer, "           RLP Payload: {}", hex_encode(&value)).unwrap();
+            }
+
+            // 5. 트랜잭션 수신 확인 (p + TxHash)
+            'p' => {
+                writeln!(writer, "[TX_RECEIPT] Tx Hash: 0x{}", hex_encode(body)).unwrap();
+            }
+
+            // 6. 시스템 설정 및 기타 (단어 키)
             _ => {
-                let key_name = String::from_utf8_lossy(&key);
-                writeln!(writer, "[SYSTEM] Key: {} | Value: {}", key_name, hex_encode(&value)).unwrap();
+                let key_str = String::from_utf8_lossy(&key);
+                if key_str == "last_block" {
+                    writeln!(writer, "[SYSTEM] Last Block Hash: 0x{}", hex_encode(&value)).unwrap();
+                } else {
+                    // 프리픽스가 없는 일반 데이터인 경우
+                    writeln!(writer, "[RAW_DATA] Key: {} | Val: {}", key_str, hex_encode(&value)).unwrap();
+                }
             }
         }
         writeln!(writer, "{:-^60}", "").unwrap();
     }
 
     writer.flush().unwrap();
-    println!("분석 완료! 총 {}개의 아이템을 파일에 기록했습니다.", count);
+    println!("분석 완료: {}", output_path);
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

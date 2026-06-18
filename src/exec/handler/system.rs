@@ -54,6 +54,7 @@ pub fn register_token(
         from_acc.pay_gas(fee, &gas_tkn);
         from_acc.inc_nonce();
     }
+    state.add_to_gas_pool(fee);
     {
         let to_acc = state.get_account_safe(&to, cur_height, db);
         to_acc.add_balance(&ticker, value);
@@ -66,7 +67,8 @@ pub fn register_token(
     changed_accounts.insert(from, state.get_account_read_safe(&from, cur_height, db).map_err(|e| format!("{:?}", e))?);
     Ok(StateDiff{
         accounts: changed_accounts,
-        token_changed: Some(ticker)
+        token_changed: Some(ticker),
+        config_changed: false,
     })
 }
 

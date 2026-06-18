@@ -402,7 +402,7 @@
                     value: "0x" + BigInt(rawAmount).toString(16),
                     nonce: nonce,
                     payload: Array.from(payloadBytes),
-                    signature: cleanHex(sig)
+                    signature: [cleanHex(sig)]
                 };
 
                 const res = await fetch(`${RPC_URL}/transaction`, {

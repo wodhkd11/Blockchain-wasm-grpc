@@ -33,6 +33,7 @@ pub fn config_update(
         changed_accounts.insert(from, from_acc.clone());
     }
 
+    state.add_to_gas_pool(fee);
     let min_gas = match update.min_gas_price{
         Some(v) => {
             if v == U256::zero() { return Err("[CONFIG]: GAS_FEE_CANNOT_BE_0".into()); }
@@ -71,5 +72,6 @@ pub fn config_update(
     Ok(StateDiff{
         accounts: changed_accounts,
         token_changed: None,
+        config_changed: true,
     })
 }

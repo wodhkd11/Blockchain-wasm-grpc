@@ -59,6 +59,12 @@ impl GlobalBalance{
         Ok(db.get_account_flat(addr).unwrap_or_else(|| Account::new(cur_height)))
     }
 
+    pub fn add_to_gas_pool(&mut self, amount: Balance) {
+        if !amount.is_zero(){
+            self.gas_pool += amount;
+        }
+    }
+
     //methods
 
     pub fn get_token_balance_safe(
@@ -93,9 +99,11 @@ impl GlobalBalance{
         Ok(account.nonce == tx_nonce)
     }
 
-    pub fn distribute_gas(&mut self, cur_height: u64, db: &Storage) -> Result<(), StateError>{
+    pub fn distribute_gas(&mut self, cur_height: u64, db: &Storage) -> Result<HashMap<Address, Account>, StateError>{
         let gas_tkn = self.config.gas_token.clone();
-        if self.gas_pool == Balance::zero(){return Ok(());}
+        println!("[D3]: {}", self.gas_pool);
+        let mut rewarded_accounts = HashMap::new();
+        if self.gas_pool == Balance::zero(){return Ok(rewarded_accounts);}
 
         let total_gas = self.gas_pool;
         self.gas_pool = Balance::zero();
@@ -119,8 +127,9 @@ impl GlobalBalance{
                 let account = self.get_account_safe(&addr, cur_height, db);
                 account.add_balance(&gas_tkn, reward);
                 account.last_seen_block = cur_height;
+                rewarded_accounts.insert(addr, account.clone());
             }
         }
-    Ok(())
+    Ok(rewarded_accounts)
     }
 }

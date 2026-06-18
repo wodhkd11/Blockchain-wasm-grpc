@@ -47,6 +47,16 @@ pub const OP_PAY_PURCHASE: u8 = 0x04;
 pub fn apply_transaction(state: &mut GlobalBalance, tx: &TransactionData, cur_height: u64, db:&Storage)
  -> Result<StateDiff, String>{
     //let current_config = &state.config; //권환관련되서 로직해야됨
+    match state.get_account_read_safe(&tx.sender, cur_height, &db){
+        Ok(acc) => {
+            if acc.is_frozen {
+                return Err("Transaction Denied: Account is frozen".into());
+            }
+        }
+        Err(e) => {
+            return Err(e.to_string());
+        }
+    };
 
     let raw_payload: RawPayload = decode_payload(&tx.payload)?;
     let opcode = raw_payload.opcode;
@@ -71,19 +81,21 @@ pub fn apply_transaction(state: &mut GlobalBalance, tx: &TransactionData, cur_he
         },
         None => {state.config.min_gas_price}
     };
+    let data: serde_json::Value = serde_json::from_slice(&raw_payload.data)
+        .map_err(|e| format!("INVALID_DATA_FORMAT: {:?}", e))?;
 
     match opcode{
         OP_SYSTEM_REGISTER_TOKEN => {
-            register_token(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), raw_payload.data, cur_height, &db)
+            register_token(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), data, cur_height, &db)
         },
         OP_TOKEN_TRANSFER => {
-            handle_transfer(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), raw_payload.data, cur_height, &db)
+            handle_transfer(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), data, cur_height, &db)
         }
         OP_TOKEN_MINT => {
-            handle_mint(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), raw_payload.data, cur_height, &db)
+            handle_mint(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), data, cur_height, &db)
         }
         OP_CONFIG => {
-            config_update(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), raw_payload.data, cur_height, &db)
+            config_update(state, tx.sender, tx.receiver, Balance::from(tx.value), Balance::from(fee), data, cur_height, &db)
         }
         _ => Err("OP NOT FOUND".to_string())
     }
@@ -105,6 +117,6 @@ pub fn execute_block(state: &mut GlobalBalance, block: &BlockData, db: &Storage)
             token_updates.insert(ticker);
         }
     }
-    state.distribute_gas(block.header.height, db);
+    let _ = state.distribute_gas(block.header.height, db);
     Ok((state_updates, token_updates))
 }

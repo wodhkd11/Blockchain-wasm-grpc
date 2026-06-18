@@ -49,12 +49,22 @@ pub struct Account{
     pub nonce: u64,
     pub last_seen_block: u64,
     pub asset_root: H256,
+    pub is_frozen: bool,
 }
 impl Account{
     pub fn new(cur_block: u64) -> Self{
-       Self { balance: HashMap::new(), nonce: 0, last_seen_block: cur_block, asset_root: H256::zero() }
+       Self { balance: HashMap::new(), nonce: 0, last_seen_block: cur_block, asset_root: H256::zero(), is_frozen: false}
     }
 }
+// impl Encodable for Account{
+//     fn rlp_append(&self, s: &mut rlp::RlpStream) {
+//         s.begin_list(3);
+//         s.append(&self.nonce);
+//         let balance_vec: Vec<(String, U256)> = self.balance.iter().map(|(k,v)| (k.clone(), *v)).collect();
+//         s.append_list(&balance_vec);
+//         s.append(&self.is_frozen);
+//     }
+// }
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +79,7 @@ pub struct GlobalBalance{
 pub struct StateDiff{
     pub accounts: HashMap<Address, Account>,
     pub token_changed: Option<TokenTicker>,
+    pub config_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +105,7 @@ pub struct AccountState{
     pub nonce: u64,
     pub primary_assets: Vec<PrimaryAsset>,
     pub asset_root: H256,
+    pub is_frozen: bool,
 }
 
 impl Encodable for PrimaryAsset{
@@ -119,8 +131,11 @@ impl Encodable for AccountState{
     fn rlp_append(&self, s: &mut rlp::RlpStream) {
         s.begin_list(3);
         s.append(&self.nonce);
-        s.append_list(&self.primary_assets);
+        let mut assets = self.primary_assets.clone();
+        assets.sort_by(|a, b| a.ticker.cmp(&b.ticker));
+        s.append_list(&assets);
         s.append(&self.asset_root);
+        s.append(&self.is_frozen);
     }
 }
 impl Decodable for AccountState{
@@ -128,10 +143,12 @@ impl Decodable for AccountState{
         let nonce: u64 = rlp.val_at(0)?;
         let primary_assets: Vec<PrimaryAsset> = rlp.list_at(1)?;
         let asset_root_bytes: Vec<u8> = rlp.val_at(2)?;
+        let is_frozen: bool = rlp.val_at(3)?;
         Ok(Self{
             nonce,
             primary_assets,
             asset_root: H256::from_slice(&asset_root_bytes),
+            is_frozen,
         })
     }
 }
